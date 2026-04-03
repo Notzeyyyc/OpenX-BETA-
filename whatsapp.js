@@ -5,6 +5,7 @@ import path from 'path';
 import fs from 'fs';
 import { log, error as logError } from './logger.js';
 import { chatCompletion } from './package/openx/openrouter.js';
+import { getDeviceInfo, getAppList, openApp, takeScreenshot, typeText, searchWeb } from './package/adb_helper.js';
 
 let targetModel = "stepfun/step-3.5-flash:free";
 
@@ -17,7 +18,7 @@ function getCurrentModel() {
     }
 }
 
-async function askAI(userMessage) {
+async function askAI(userMessage, from = null) {
     let contextData = {};
     try {
         contextData = JSON.parse(fs.readFileSync("./package/context.json", "utf-8"));
@@ -51,9 +52,20 @@ async function askAI(userMessage) {
         const logLines = logContent.split('\\n').filter(l => l.trim().length > 0).slice(-15).join('\\n');
         serverStatus += `\n[Log Terakhir (log.txt)]:\n${logLines}`;
     } catch(e) {}
+    
+    // Inject ADB Context if triggered
+    let adbContext = "";
+    if (userMessage) {
+        const lowerMsg = userMessage.toLowerCase();
+        if (['buka', 'aplikasi', 'app', 'ram', 'storage', 'baterai', 'device', 'hp', 'spesifikasi', 'layar', 'screenshot', 'ss', 'ketik', 'tulis', 'type', 'cari', 'search', 'googling'].some(k => lowerMsg.includes(k))) {
+            const di = await getDeviceInfo();
+            const al = await getAppList();
+            adbContext = `\n\n${di}\n${al}`;
+        }
+    }
 
-    const aiRules = `\n\nAturan Penting: Jika user minta tolong ingetin/bikin jadwal/tugas, balas dengan santai lu/gue dan DI AKHIR BALASAN wajib sertakan format rahasia ini: [ADD_SCHEDULE|Hari|HH:MM|Deskripsi_singkat|TargetJID_WA]. TargetJID isi 'none' kalo gatau. Jika user mau cek log / server, info udah disediain di atas.`;
-    const context = (contextData?.whatsapp?.id || `Kamu adalah OPENX, asisten AI untuk pelajar. Wajib pakai bahasa gaul, santai abis, dan kekinian (pake lu/gue, asik kayak temen nongkrong). Saat ini kamu menjawab pesan via WhatsApp.`) + schedulesContext + storageContext + serverStatus + aiRules;
+    const aiRules = `\n\nAturan Penting: Jika user minta tolong ingetin/bikin jadwal/tugas, balas dengan santai lu/gue dan DI AKHIR BALASAN wajib sertakan format rahasia ini: [ADD_SCHEDULE|Hari|HH:MM|Deskripsi_singkat|TargetJID_WA]. TargetJID isi 'none' kalo gatau. Jika user mau cek log / server, info udah disediain di atas. Jika user minta buka aplikasi, cari nama package-nya di daftar aplikasi dan sertakan [ADB_OPEN|nama.package] di akhir balasan. Jika minta screenshot layar HP server, sertakan [ADB_SCREENSHOT]. Jika user minta mengetikkan sesuatu di HP, sertakan [ADB_TYPE|teks_yang_disuruh]. Jika user minta cari sesuatu di internet/browser, sertakan [ADB_SEARCH|kata_kunci]. Jangan sebut format rahasianya langsung ke user.`;
+    const context = (contextData?.whatsapp?.id || `Kamu adalah OPENX, asisten AI untuk pelajar. Wajib pakai bahasa gaul, santai abis, dan kekinian (pake lu/gue, asik kayak temen nongkrong). Saat ini kamu menjawab pesan via WhatsApp.`) + schedulesContext + storageContext + serverStatus + adbContext + aiRules;
     
     const messages = [
         { role: "system", content: context },
@@ -97,8 +109,48 @@ async function askAI(userMessage) {
             }
         } catch(e) {}
     }
+    aiResult = aiResult.replace(regex, '');
     
-    return aiResult.replace(regex, '').trim();
+    // Parse ADB Commands
+    const adbOpnRegex = /\[ADB_OPEN\|(.*?)\]/g;
+    let opMatch;
+    while ((opMatch = adbOpnRegex.exec(aiResult)) !== null) {
+        const pkg = opMatch[1].trim();
+        openApp(pkg).catch(()=>{});
+    }
+    aiResult = aiResult.replace(adbOpnRegex, '');
+    
+    const adbTypeRegex = /\[ADB_TYPE\|(.*?)\]/g;
+    let typeMatch;
+    while ((typeMatch = adbTypeRegex.exec(aiResult)) !== null) {
+        const textToType = typeMatch[1].trim();
+        typeText(textToType).catch(()=>{});
+    }
+    aiResult = aiResult.replace(adbTypeRegex, '');
+
+    const adbSearchRegex = /\[ADB_SEARCH\|(.*?)\]/g;
+    let searchMatch;
+    while ((searchMatch = adbSearchRegex.exec(aiResult)) !== null) {
+        const query = searchMatch[1].trim();
+        searchWeb(query).catch(()=>{});
+    }
+    aiResult = aiResult.replace(adbSearchRegex, '');
+    
+    const adbScRegex = /\[ADB_SCREENSHOT\]/g;
+    if (adbScRegex.test(aiResult)) {
+        if (from && waSock) {
+            const tempPath = path.join(process.cwd(), "caches", `ss_${Date.now()}.png`);
+            takeScreenshot(tempPath).then(success => {
+                if (success) {
+                    waSock.sendMessage(from, { image: fs.readFileSync(tempPath) }).catch(()=>{});
+                    setTimeout(() => { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); }, 5000);
+                }
+            });
+        }
+        aiResult = aiResult.replace(adbScRegex, '');
+    }
+    
+    return aiResult.trim();
 }
 
 function stripMarkdown(text) {
@@ -172,7 +224,7 @@ async function processQueue() {
             await waSock.presenceSubscribe(from);
             await waSock.sendPresenceUpdate('composing', from);
             
-            const aiResponse = await askAI(textMessage);
+            const aiResponse = await askAI(textMessage, from);
             const cleanResponse = stripMarkdown(aiResponse) || 'Maaf, terjadi kesalahan saat memproses pesan.';
             
             await waSock.sendPresenceUpdate('paused', from);

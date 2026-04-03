@@ -6,6 +6,7 @@ import { chatCompletion } from "./package/openx/openrouter.js";
 import { log, error as logError } from "./logger.js";
 import { connectToWhatsApp, waSock } from "./whatsapp.js";
 import cron from "node-cron";
+import { getDeviceInfo, getAppList, openApp, takeScreenshot, typeText, searchWeb } from './package/adb_helper.js';
 
 const bot = new TelegramBot(config.telegram.token, { polling: true });
 const USER_LANGS = new Map();
@@ -193,7 +194,19 @@ async function askAI(chatId, userMessage, systemContext = null) {
     } catch(e) {}
     resolvedContext += serverStatus;
     
-    const aiRules = `\n\nAturan Penting: Jika user minta tolong ingetin/bikin jadwal/tugas secara interaktif, balas secara natural dan DI AKHIR BALASAN wajib sertakan format rahasia ini: [ADD_SCHEDULE|Hari|HH:MM|Deskripsi_singkat|TargetJID_ATAU_none]. Contoh: [ADD_SCHEDULE|Senin|07:00|Upacara|none]. Jika user mau liat log / status server, infokan berdasarkan context dari system ini.`;
+    // Inject ADB Context if triggered
+    let adbContext = "";
+    if (userMessage) {
+        const lowerMsg = userMessage.toLowerCase();
+        if (['buka', 'aplikasi', 'app', 'ram', 'storage', 'baterai', 'device', 'hp', 'spesifikasi', 'layar', 'screenshot', 'ss', 'ketik', 'tulis', 'type', 'cari', 'search', 'googling'].some(k => lowerMsg.includes(k))) {
+            const di = await getDeviceInfo();
+            const al = await getAppList();
+            adbContext = `\n\n${di}\n${al}`;
+        }
+    }
+    resolvedContext += adbContext;
+    
+    const aiRules = `\n\nAturan Penting: Jika user minta tolong ingetin/bikin jadwal/tugas secara interaktif, balas secara natural dan DI AKHIR BALASAN wajib sertakan format rahasia ini: [ADD_SCHEDULE|Hari|HH:MM|Deskripsi_singkat|TargetJID_ATAU_none]. Contoh: [ADD_SCHEDULE|Senin|07:00|Upacara|none]. Jika user mau liat log / status server, infokan berdasarkan context dari system ini. Jika user minta buka aplikasi, cari nama package-nya di daftar aplikasi dan sertakan [ADB_OPEN|nama.package] di akhir balasan. Jika minta screenshot layar HP server, sertakan [ADB_SCREENSHOT]. Jika user minta mengetikkan sesuatu di HP, sertakan [ADB_TYPE|teks_yang_disuruh]. Jika user minta cari sesuatu di internet/browser, sertakan [ADB_SEARCH|kata_kunci]. Jangan sebut format rahasianya langsung ke user.`;
     
     const context = systemContext || (resolvedContext + aiRules);
     
@@ -238,8 +251,48 @@ async function askAI(chatId, userMessage, systemContext = null) {
             }
         } catch(e) {}
     }
+    aiResult = aiResult.replace(regex, '');
     
-    return aiResult.replace(regex, '').trim();
+    // Parse ADB Commands
+    const adbOpnRegex = /\[ADB_OPEN\|(.*?)\]/g;
+    let opMatch;
+    while ((opMatch = adbOpnRegex.exec(aiResult)) !== null) {
+        const pkg = opMatch[1].trim();
+        openApp(pkg).catch(()=>{});
+    }
+    aiResult = aiResult.replace(adbOpnRegex, '');
+    
+    const adbTypeRegex = /\[ADB_TYPE\|(.*?)\]/g;
+    let typeMatch;
+    while ((typeMatch = adbTypeRegex.exec(aiResult)) !== null) {
+        const textToType = typeMatch[1].trim();
+        typeText(textToType).catch(()=>{});
+    }
+    aiResult = aiResult.replace(adbTypeRegex, '');
+
+    const adbSearchRegex = /\[ADB_SEARCH\|(.*?)\]/g;
+    let searchMatch;
+    while ((searchMatch = adbSearchRegex.exec(aiResult)) !== null) {
+        const query = searchMatch[1].trim();
+        searchWeb(query).catch(()=>{});
+    }
+    aiResult = aiResult.replace(adbSearchRegex, '');
+    
+    const adbScRegex = /\[ADB_SCREENSHOT\]/g;
+    if (adbScRegex.test(aiResult)) {
+        if (chatId && bot) {
+            const tempPath = path.join(process.cwd(), "caches", `ss_tg_${Date.now()}.png`);
+            takeScreenshot(tempPath).then(success => {
+                if (success) {
+                    bot.sendPhoto(chatId, fs.createReadStream(tempPath)).catch(()=>{});
+                    setTimeout(() => { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); }, 5000);
+                }
+            });
+        }
+        aiResult = aiResult.replace(adbScRegex, '');
+    }
+    
+    return aiResult.trim();
 }
 
 function stripMarkdown(text) {
