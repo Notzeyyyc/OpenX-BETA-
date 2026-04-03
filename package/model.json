@@ -1,0 +1,8 @@
+{
+    "defaultModel": "minimax/minimax-m2.5:free",
+    "availableModels": [
+        "liquid/lfm-2.5-1.2b-thinking:free",
+        "minimax/minimax-m2.5:free",
+        "openai/gpt-oss-120b:free"
+    ]
+}
