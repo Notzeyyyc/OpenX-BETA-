@@ -11,32 +11,33 @@ import { getDeviceInfo, getAppList, openApp, takeScreenshot, typeText, searchWeb
 const bot = new TelegramBot(config.telegram.token, { polling: true });
 const USER_LANGS = new Map();
 
+// UI Text for Telegram Bot (Supports Indonesian and English)
 const MESSAGES = {
     id: {
-        welcome: (name, model) => `Halo ${name}! Saya OPENX, asisten AI untuk pelajar Indonesia (OpenClaw version).\n\nModel: ${model}\n\nKirim pesan apa saja untuk mulai berbicara dengan saya. Anda juga bisa mengirim file/gambar dan saya akan membantu menyimpannya.`,
-        accessDenied: "AKSES DITOLAK\n\nKamu tidak memiliki izin untuk menggunakan bot ini.",
+        welcome: (name, model) => `Yo ${name}! I'm OPENX, your student AI assistant (OpenClaw version).\n\nModel: ${model}\n\nSend me anything to chat. You can also toss me files/images and I'll keep 'em safe for you.`,
+        accessDenied: "ACCESS DENIED\n\nYou're not on the list to use this bot, sorry!",
         thinking: "...",
-        error: "Maaf, terjadi kesalahan. Silakan coba lagi.",
-        fileSaved: (id) => `File berhasil disimpan dengan ID: ${id}`,
-        fileNotFound: "File dengan ID tersebut tidak ditemukan.",
-        modelChanged: (model) => `Model diubah ke: ${model}`,
-        langChanged: "Bahasa diubah ke Indonesia",
-        profileTitle: "Profil Pengguna",
-        profileName: "Nama",
+        error: "My bad, something went wrong. Try again?",
+        fileSaved: (id) => `File locked in! ID: ${id}`,
+        fileNotFound: "Couldn't find any file with that ID. Double check it!",
+        modelChanged: (model) => `Model swapped to: ${model}`,
+        langChanged: "Switching language to Indonesian!",
+        profileTitle: "User Profile",
+        profileName: "Name",
         profileId: "ID",
         profileStatus: "Status",
         profileModel: "Model",
-        profileLanguage: "Bahasa",
+        profileLanguage: "Language",
         statusDeveloper: "Developer",
         statusStudent: "Student",
-        langButton: "Ganti Bahasa",
+        langButton: "Change Language",
         langButtonID: "Indonesia",
         langButtonEN: "English",
-        backButton: "Kembali",
-        helpText: "Perintah tersedia:\n/start - Mulai bot\n/profile - Lihat profil & ganti bahasa\n/model - Ganti model AI\n/help - Bantuan\n\nUntuk mengambil file yang sudah disimpan, cukup kirim ID file (angka 5 digit)."
+        backButton: "Back",
+        helpText: "Commands:\n/start - Kick things off\n/profile - View profile & swap languages\n/model - Swap AI models\n/help - Need a hand?\n\nTo grab a saved file, just send the 5-digit file ID."
     },
     en: {
-        welcome: (name, model) => `Hello ${name}! I'm OPENX, an AI assistant for Indonesian students (OpenClaw version).\n\nModel: ${model}\n\nSend any message to start talking with me. You can also send files/images and I'll help store them.`,
+        welcome: (name, model) => `Hello ${name}! I'm OPENX, an AI assistant for students (OpenClaw version).\n\nModel: ${model}\n\nSend any message to start talking with me. You can also send files/images and I'll help store them.`,
         accessDenied: "ACCESS DENIED\n\nYou don't have permission to use this bot.",
         thinking: "...",
         error: "Sorry, an error occurred. Please try again.",
@@ -60,20 +61,24 @@ const MESSAGES = {
     }
 };
 
+// Helper: Get user's preferred language
 function getLang(chatId) {
     return USER_LANGS.get(chatId) || 'id';
 }
 
+// Translate logic with dynamic args
 function t(chatId, key, ...args) {
     const lang = getLang(chatId);
     const msg = MESSAGES[lang][key];
     return typeof msg === 'function' ? msg(...args) : msg;
 }
 
+// Generate a random 5-digit file ID
 function generateFileId() {
     return Math.floor(10000 + Math.random() * 90000).toString();
 }
 
+// Fetch current default AI model
 function getCurrentModel() {
     try {
         const modelData = JSON.parse(fs.readFileSync("./package/model.json", "utf-8"));
@@ -83,6 +88,7 @@ function getCurrentModel() {
     }
 }
 
+// Check if user has access (Dev or Whitelisted Student)
 function isAuthorized(chatId) {
     const ownerId = parseInt(config.telegram.devId);
     let students = [];
@@ -97,6 +103,7 @@ function isAuthorized(chatId) {
     return chatId === ownerId || students.includes(chatId);
 }
 
+// Ensure specific dir for user files exist
 function ensureUserDir(chatId) {
     const dir = path.join("./caches/files", String(chatId));
     if (!fs.existsSync(dir)) {
@@ -105,6 +112,7 @@ function ensureUserDir(chatId) {
     return dir;
 }
 
+// Save file metadata to persistent storage
 function saveFile(chatId, fileId, filename) {
     const dir = ensureUserDir(chatId);
     const metaPath = path.join(dir, "meta.json");
@@ -123,6 +131,7 @@ function saveFile(chatId, fileId, filename) {
     return fileIdNum;
 }
 
+// Fetch file metadata by ID
 function getFileById(chatId, fileIdNum) {
     const dir = path.join("./caches/files", String(chatId));
     const metaPath = path.join(dir, "meta.json");
@@ -134,6 +143,7 @@ function getFileById(chatId, fileIdNum) {
     }
 }
 
+// List all files for a specific user
 function listFiles(chatId) {
     const dir = path.join("./caches/files", String(chatId));
     const metaPath = path.join(dir, "meta.json");
@@ -145,10 +155,14 @@ function listFiles(chatId) {
     }
 }
 
+/**
+ * AI logic for Telegram Bot.
+ * Manages contexts, ADB actions, and schedules.
+ */
 async function askAI(chatId, userMessage, systemContext = null) {
     const lang = getLang(chatId);
     const files = listFiles(chatId);
-    const fileList = files.length > 0 ? files.map(f => `${f.id}: ${f.filename}`).join(", ") : "(kosong)";
+    const fileList = files.length > 0 ? files.map(f => `${f.id}: ${f.filename}`).join(", ") : "(empty)";
     
     let contextData = {};
     try {
@@ -157,20 +171,22 @@ async function askAI(chatId, userMessage, systemContext = null) {
 
     const defaultContextStr = contextData?.telegram?.[lang] || 
         (lang === 'id' 
-            ? "Kamu adalah OPENX, asisten AI untuk pelajar. Wajib pakai bahasa gaul, santai abis, pake lu/gue biar asik kayak temen nongkrong.\nInfo user:\n- Chat ID: {chatId}\n- File tersimpan: {fileList}"
+            ? "Lu adalah OPENX, asisten AI khusus buat pelajar. Wajib banget pake bahasa indonesia gaul, santai, pake lu/gue, chill abis, dan asik kayak temen nongkrong tongkrongan.\nInfo user:\n- Chat ID: {chatId}\n- File tersimpan: {fileList}"
             : "You are OPENX, an AI assistant for Indonesian students.\nUser info:\n- Chat ID: {chatId}\n- Saved files: {fileList}");
     
     let resolvedContext = defaultContextStr.replace("{chatId}", chatId).replace("{fileList}", fileList);
     
+    // Fetch schedule context
     let schedulesContext = "";
     try {
         const schedules = JSON.parse(fs.readFileSync("./package/schedules.json", "utf-8"));
         if (schedules.length > 0) {
-            schedulesContext = "\n\nInformasi Jadwal Sekolah/Tugas:\n" + schedules.map(s => `- ${s.day} ${s.time}: ${s.text}`).join("\n");
+            schedulesContext = "\n\nSchedules/Tasks Info:\n" + schedules.map(s => `- ${s.day} ${s.time}: ${s.text}`).join("\n");
         }
     } catch(e) {}
     resolvedContext += schedulesContext;
     
+    // Fetch persistent memory context
     let storageContext = "";
     try {
         const storageDir = "./package/storage";
@@ -179,44 +195,54 @@ async function askAI(chatId, userMessage, systemContext = null) {
             for (const file of files) {
                 const filePath = path.join(storageDir, file);
                 if (fs.statSync(filePath).isFile()) {
-                    storageContext += `\n[Info/Memori dari ${file}]:\n${fs.readFileSync(filePath, "utf-8")}\n`;
+                    storageContext += `\n[Info/Memory from ${file}]:\n${fs.readFileSync(filePath, "utf-8")}\n`;
                 }
             }
         }
     } catch(e) {}
     resolvedContext += storageContext;
     
-    let serverStatus = `\n\n[Status Server]: Uptime ${Math.floor(process.uptime() / 60)} menit, RAM ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB.`;
+    // Server health/status context
+    let serverStatus = `\n\n[Server Status]: Uptime ${Math.floor(process.uptime() / 60)} mins, RAM ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB.`;
     try {
         const logContent = fs.readFileSync("./log.txt", "utf-8");
-        const logLines = logContent.split('\\n').filter(l => l.trim().length > 0).slice(-15).join('\\n');
-        serverStatus += `\n[Log Terakhir (log.txt)]:\n${logLines}`;
+        const logLines = logContent.split('\n').filter(l => l.trim().length > 0).slice(-15).join('\n');
+        serverStatus += `\n[Recent Logs (log.txt)]:\n${logLines}`;
     } catch(e) {}
     resolvedContext += serverStatus;
     
-    // Inject ADB Context if triggered
+    // Inject ADB Context if relevant keywords are used
     let adbContext = "";
     if (userMessage) {
         const lowerMsg = userMessage.toLowerCase();
-        if (['buka', 'aplikasi', 'app', 'ram', 'storage', 'baterai', 'device', 'hp', 'spesifikasi', 'layar', 'screenshot', 'ss', 'ketik', 'tulis', 'type', 'cari', 'search', 'googling'].some(k => lowerMsg.includes(k))) {
+        if (['open', 'app', 'ram', 'storage', 'battery', 'device', 'specs', 'screen', 'screenshot', 'ss', 'type', 'write', 'search', 'google'].some(k => lowerMsg.includes(k))) {
             const di = await getDeviceInfo();
             const al = await getAppList();
-            adbContext = `\n\n${di}\n${al}`;
+            adbContext = `\n\nReal Device Data:\n${di}\n${al}`;
         }
     }
     resolvedContext += adbContext;
     
-    const aiRules = `\n\nAturan Penting: Jika user minta tolong ingetin/bikin jadwal/tugas secara interaktif, balas secara natural dan DI AKHIR BALASAN wajib sertakan format rahasia ini: [ADD_SCHEDULE|Hari|HH:MM|Deskripsi_singkat|TargetJID_ATAU_none]. Contoh: [ADD_SCHEDULE|Senin|07:00|Upacara|none]. Jika user mau liat log / status server, infokan berdasarkan context dari system ini. Jika user minta buka aplikasi, cari nama package-nya di daftar aplikasi dan sertakan [ADB_OPEN|nama.package] di akhir balasan. Jika minta screenshot layar HP server, sertakan [ADB_SCREENSHOT]. Jika user minta mengetikkan sesuatu di HP, sertakan [ADB_TYPE|teks_yang_disuruh]. Jika user minta cari sesuatu di internet/browser, sertakan [ADB_SEARCH|kata_kunci]. Jangan sebut format rahasianya langsung ke user.`;
+    // Aturan interaksi core
+    const aiRules = `\n\nAturan Penting:
+1. Untuk pengingat/jadwal: balas secara natural dan sertakan [ADD_SCHEDULE|Hari|HH:MM|Deskripsi|TargetJID_ATAU_none] di paling akhir balasan.
+2. Untuk log server / status: infokan berdasarkan context dari system ini.
+3. Untuk buka aplikasi: cari nama package-nya di daftar aplikasi dan sertakan [ADB_OPEN|nama.package].
+4. Untuk screenshot: sertakan [ADB_SCREENSHOT].
+5. Untuk mengetik: sertakan [ADB_TYPE|teks_yang_diketik].
+6. Untuk mencari di web: sertakan [ADB_SEARCH|query].
+Bawaannya santai aja, jangan pernah sebut tag mentah di atas langsung ke user.`;
     
     const context = systemContext || (resolvedContext + aiRules);
     
-    const messages = [
+    const contextMessages = [
         { role: "system", content: context },
         { role: "user", content: userMessage }
     ];
     
-    let aiResult = await chatCompletion(messages, getCurrentModel());
+    let aiResult = await chatCompletion(contextMessages, getCurrentModel());
     
+    // Handle Schedule Tag
     const regex = /\[ADD_SCHEDULE\|(.*?)\|(.*?)\|(.*?)\|(.*?)\]/g;
     let match;
     while ((match = regex.exec(aiResult)) !== null) {
@@ -253,7 +279,7 @@ async function askAI(chatId, userMessage, systemContext = null) {
     }
     aiResult = aiResult.replace(regex, '');
     
-    // Parse ADB Commands
+    // Parse ADB Commands from AI
     const adbOpnRegex = /\[ADB_OPEN\|(.*?)\]/g;
     let opMatch;
     while ((opMatch = adbOpnRegex.exec(aiResult)) !== null) {
@@ -295,6 +321,7 @@ async function askAI(chatId, userMessage, systemContext = null) {
     return aiResult.trim();
 }
 
+// Remove markdown symbols for cleaner message rendering
 function stripMarkdown(text) {
     if (!text) return text;
     return text
@@ -323,7 +350,7 @@ bot.onText(/\/start/, async (msg) => {
     const waitMsg = await bot.sendMessage(chatId, t(chatId, "thinking"));
     
     try {
-        const aiWelcome = await askAI(chatId, "User baru memulai chat. Sapa mereka dan beritahu cara menggunakan OPENX dengan bahasa gaul.");
+        const aiWelcome = await askAI(chatId, "User just started the chat. Greet them and explain how to use OPENX in a super casual/gaul way.");
         await bot.deleteMessage(chatId, waitMsg.message_id);
         bot.sendMessage(chatId, stripMarkdown(aiWelcome) || t(chatId, "welcome", username, getCurrentModel()));
         log(`Successfully responded to start command for ${chatId}`);
@@ -341,7 +368,7 @@ bot.onText(/\/help/, async (msg) => {
     const waitMsg = await bot.sendMessage(chatId, t(chatId, "thinking"));
     
     try {
-        const aiHelp = await askAI(chatId, "User meminta bantuan. Jelaskan cara menggunakan OPENX dengan ramah.");
+        const aiHelp = await askAI(chatId, "User is asking for help. Explain how to use OPENX friendly and casually.");
         await bot.deleteMessage(chatId, waitMsg.message_id);
         bot.sendMessage(chatId, stripMarkdown(aiHelp) || t(chatId, "helpText"));
     } catch (error) {
@@ -364,9 +391,9 @@ bot.onText(/\/model/, async (msg) => {
         callback_data: `set_model_${model}`
     }]);
 
-    bot.sendMessage(chatId, `Pilih Model AI:\n\nAktif: ${modelData.defaultModel}`, {
+    bot.sendMessage(chatId, `Select AI Model:\n\nActive: ${modelData.defaultModel}`, {
         reply_markup: {
-            inline_keyboard: [...modelButtons, [{ text: "Kembali", callback_data: "cancel_model" }]]
+            inline_keyboard: [...modelButtons, [{ text: "Back", callback_data: "cancel_model" }]]
         }
     });
 });
@@ -405,7 +432,7 @@ bot.onText(/\/lang/, async (msg) => {
     const waitMsg = await bot.sendMessage(chatId, t(chatId, "thinking"));
     
     try {
-        const aiResponse = await askAI(chatId, `User mengganti bahasa ke ${newLang === 'id' ? 'Bahasa Indonesia' : 'English'}. Konfirmasi perubahan bahasa dengan ramah.`);
+        const aiResponse = await askAI(chatId, `User changed the language to ${newLang === 'id' ? 'Bahasa Indonesia' : 'English'}. Confirm the change casually.`);
         await bot.deleteMessage(chatId, waitMsg.message_id);
         bot.sendMessage(chatId, stripMarkdown(aiResponse) || confirmMsg);
     } catch (error) {
@@ -420,7 +447,7 @@ bot.on("callback_query", async (query) => {
     const data = query.data;
 
     if (!isAuthorized(chatId)) {
-        bot.answerCallbackQuery(query.id, { text: "Akses ditolak!" });
+        bot.answerCallbackQuery(query.id, { text: "Access Denied!" });
         return;
     }
 
@@ -435,7 +462,7 @@ bot.on("callback_query", async (query) => {
             
             const waitMsg = await bot.sendMessage(chatId, t(chatId, "thinking"));
             try {
-                const aiResponse = await askAI(chatId, `Model AI diubah ke "${selectedModel}". Konfirmasi perubahan model dengan ramah.`);
+                const aiResponse = await askAI(chatId, `AI Model changed to "${selectedModel}". Confirm the change casually.`);
                 await bot.deleteMessage(chatId, waitMsg.message_id);
                 await bot.deleteMessage(chatId, messageId);
                 bot.sendMessage(chatId, stripMarkdown(aiResponse) || t(chatId, "modelChanged", selectedModel));
@@ -445,7 +472,7 @@ bot.on("callback_query", async (query) => {
                 bot.sendMessage(chatId, t(chatId, "modelChanged", selectedModel));
             }
         } catch (error) {
-            bot.answerCallbackQuery(query.id, { text: "Gagal mengubah model!" });
+            bot.answerCallbackQuery(query.id, { text: "Failed to change model!" });
         }
     } else if (data === "cancel_model") {
         await bot.deleteMessage(chatId, messageId);
@@ -468,7 +495,7 @@ bot.on("callback_query", async (query) => {
         const oldLang = getLang(chatId);
         
         if (oldLang === newLang) {
-            bot.answerCallbackQuery(query.id, { text: newLang === 'id' ? "Bahasa sudah Indonesia" : "Language already English" });
+            bot.answerCallbackQuery(query.id, { text: newLang === 'id' ? "Already in Indonesian" : "Already in English" });
             return;
         }
         
@@ -477,7 +504,7 @@ bot.on("callback_query", async (query) => {
         
         bot.answerCallbackQuery(query.id, { text: confirmMsg });
         
-        // Update profile view with new language
+        // Refresh profile view with updated language
         const username = query.from.username || query.from.first_name || "User";
         const status = chatId === parseInt(config.telegram.devId) ? t(chatId, "statusDeveloper") : t(chatId, "statusStudent");
         const currentLang = newLang === 'id' ? t(chatId, "langButtonID") : t(chatId, "langButtonEN");
@@ -494,7 +521,7 @@ bot.on("callback_query", async (query) => {
             }
         });
     } else if (data === "back_profile") {
-        // Go back to profile view
+        // Return to main profile view
         const username = query.from.username || query.from.first_name || "User";
         const status = chatId === parseInt(config.telegram.devId) ? t(chatId, "statusDeveloper") : t(chatId, "statusStudent");
         const currentLang = getLang(chatId) === 'id' ? t(chatId, "langButtonID") : t(chatId, "langButtonEN");
@@ -518,7 +545,7 @@ bot.on("message", async (msg) => {
     const chatId = msg.chat.id;
     if (!isAuthorized(chatId)) return;
     
-    // Relay pesan Telegram -> WhatsApp via fitur Reply
+    // Relay Telegram messages to WhatsApp via Reply feature
     if (msg.reply_to_message && msg.reply_to_message.text && msg.text && !msg.text.startsWith('/')) {
         const repliedText = msg.reply_to_message.text;
         const match = repliedText.match(/ID: `([^`]+)`/);
@@ -526,19 +553,19 @@ bot.on("message", async (msg) => {
             const waJid = match[1];
             try {
                 await waSock.sendMessage(waJid, { text: msg.text });
-                bot.sendMessage(chatId, `✅ Balasan terkirim ke WA \`${waJid}\``, { parse_mode: "Markdown" });
+                bot.sendMessage(chatId, `✅ Reply sent to WA \`${waJid}\``, { parse_mode: "Markdown" });
             } catch (err) {
-                bot.sendMessage(chatId, `❌ Gagal membalas ke WA: ${err.message}`);
+                bot.sendMessage(chatId, `❌ Failed to send reply to WA: ${err.message}`);
             }
             return;
         }
     }
 
-    // Command inisiasi pesan dan config /wa, /status, /channel_set
+    // Config commands: /wa, /status, /channel_set, /waread, /wasummarize
     if (msg.text && msg.text.startsWith("/")) {
         if (msg.text.startsWith("/status ")) {
             const parts = msg.text.split(' ');
-            if (parts.length < 2) return bot.sendMessage(chatId, 'Gunakan: /status [nomor]\nContoh: /status 628123');
+            if (parts.length < 2) return bot.sendMessage(chatId, 'Usage: /status [phone_number]\nExample: /status 628123');
             const target = parts[1];
             try {
                 const configPath = "./package/wa_config.json";
@@ -548,17 +575,17 @@ bot.on("message", async (msg) => {
                 if (!waConfig.statusTargets.includes(target)) {
                     waConfig.statusTargets.push(target);
                     fs.writeFileSync(configPath, JSON.stringify(waConfig, null, 2));
-                    bot.sendMessage(chatId, `✅ Nomor ${target} ditaruh di radar pantauan Status.`);
+                    bot.sendMessage(chatId, `✅ Number ${target} added to Status Monitoring radar.`);
                 } else {
-                    bot.sendMessage(chatId, `⚠️ Nomor ${target} sudah ada di daftar.`);
+                    bot.sendMessage(chatId, `⚠️ Number ${target} is already on the list.`);
                 }
-            } catch (e) { bot.sendMessage(chatId, `❌ Gagal: ${e.message}`); }
+            } catch (e) { bot.sendMessage(chatId, `❌ Error: ${e.message}`); }
             return;
         }
 
         if (msg.text.startsWith("/channel_set ")) {
             const parts = msg.text.split(' ');
-            if (parts.length < 2) return bot.sendMessage(chatId, 'Gunakan: /channel_set [JID]\nContoh: /channel_set 123@newsletter');
+            if (parts.length < 2) return bot.sendMessage(chatId, 'Usage: /channel_set [JID]\nExample: /channel_set 123@newsletter');
             const target = parts[1];
             try {
                 const configPath = "./package/wa_config.json";
@@ -568,18 +595,18 @@ bot.on("message", async (msg) => {
                 if (!waConfig.adminChannels.includes(target)) {
                     waConfig.adminChannels.push(target);
                     fs.writeFileSync(configPath, JSON.stringify(waConfig, null, 2));
-                    bot.sendMessage(chatId, `✅ Channel ${target} masuk radar Auto-Post AI.`);
+                    bot.sendMessage(chatId, `✅ Channel ${target} added to Auto-Post AI radar.`);
                 } else {
-                    bot.sendMessage(chatId, `⚠️ Channel ${target} sudah terdaftar.`);
+                    bot.sendMessage(chatId, `⚠️ Channel ${target} is already registered.`);
                 }
-            } catch (e) { bot.sendMessage(chatId, `❌ Gagal: ${e.message}`); }
+            } catch (e) { bot.sendMessage(chatId, `❌ Error: ${e.message}`); }
             return;
         }
 
         if (msg.text.startsWith("/wa ")) {
             const parts = msg.text.split(' ');
             if (parts.length < 3) {
-                bot.sendMessage(chatId, 'Format salah. Gunakan: /wa 628xxxxx pesan anda');
+                bot.sendMessage(chatId, 'Invalid format. Use: /wa 628xxxxx your message');
                 return;
             }
             const waNumber = parts[1];
@@ -588,19 +615,19 @@ bot.on("message", async (msg) => {
                 try {
                     const targetJid = waNumber.includes('@') ? waNumber : `${waNumber}@s.whatsapp.net`;
                     await waSock.sendMessage(targetJid, { text: waMsg });
-                    bot.sendMessage(chatId, `✅ Pesan terkirim ke WhatsApp \`${waNumber}\``, { parse_mode: "Markdown" });
+                    bot.sendMessage(chatId, `✅ Message sent to WhatsApp \`${waNumber}\``, { parse_mode: "Markdown" });
                 } catch (err) {
-                    bot.sendMessage(chatId, `❌ Gagal mengirim ke WA: ${err.message}`);
+                    bot.sendMessage(chatId, `❌ Failed to send to WA: ${err.message}`);
                 }
             } else {
-                bot.sendMessage(chatId, '❌ WhatsApp belum terhubung.');
+                bot.sendMessage(chatId, '❌ WhatsApp is not connected.');
             }
             return;
         }
 
         if (msg.text.startsWith("/waread ")) {
             const target = msg.text.split(' ')[1];
-            if (!target) return bot.sendMessage(chatId, "Gunakan: /waread [JID]");
+            if (!target) return bot.sendMessage(chatId, "Usage: /waread [JID]");
             
             try {
                 const configPath = "./package/wa_config.json";
@@ -613,19 +640,19 @@ bot.on("message", async (msg) => {
                 if (!waConfig.readModeTargets.includes(cleanTarget)) {
                     waConfig.readModeTargets.push(cleanTarget);
                     fs.writeFileSync(configPath, JSON.stringify(waConfig, null, 2));
-                    bot.sendMessage(chatId, `✅ Read Mode diaktifkan untuk WA \`${cleanTarget}\`. Pesan akan dikumpulkan.`);
+                    bot.sendMessage(chatId, `✅ Read Mode enabled for WA \`${cleanTarget}\`. Messages will be collected.`);
                 } else {
                     waConfig.readModeTargets = waConfig.readModeTargets.filter(t => t !== cleanTarget);
                     fs.writeFileSync(configPath, JSON.stringify(waConfig, null, 2));
-                    bot.sendMessage(chatId, `❌ Read Mode dinonaktifkan untuk WA \`${cleanTarget}\`.`);
+                    bot.sendMessage(chatId, `❌ Read Mode disabled for WA \`${cleanTarget}\`.`);
                 }
-            } catch (e) { bot.sendMessage(chatId, `❌ Gagal: ${e.message}`); }
+            } catch (e) { bot.sendMessage(chatId, `❌ Error: ${e.message}`); }
             return;
         }
 
         if (msg.text.startsWith("/wasummarize ")) {
             const target = msg.text.split(' ')[1];
-            if (!target) return bot.sendMessage(chatId, "Gunakan: /wasummarize [JID]");
+            if (!target) return bot.sendMessage(chatId, "Usage: /wasummarize [JID]");
             
             const cleanTarget = target.includes('@') ? target : `${target}@s.whatsapp.net`;
             try {
@@ -635,30 +662,30 @@ bot.on("message", async (msg) => {
                 
                 const messagesTarget = readCache[cleanTarget];
                 if (!messagesTarget || messagesTarget.length === 0) {
-                    bot.sendMessage(chatId, `⚠️ Tidak ada pesan terkumpul untuk \`${cleanTarget}\`.`);
+                    bot.sendMessage(chatId, `⚠️ No messages collected for \`${cleanTarget}\`.`);
                     return;
                 }
                 
-                const combinedMsg = messagesTarget.join("\\n");
-                bot.sendMessage(chatId, `⏳ Meringkas ${messagesTarget.length} pesan dari \`${cleanTarget}\`...`);
+                const combinedMsg = messagesTarget.join("\n");
+                bot.sendMessage(chatId, `⏳ Summarizing ${messagesTarget.length} messages from \`${cleanTarget}\`...`);
                 
-                const prompt = `Berikut adalah percakapan/pesan yang dikumpulkan dari seseorang:\n\n${combinedMsg}\n\nTolong ringkas poin-poin intisari penting secara singkat dan padat!`;
+                const prompt = `Here are the messages collected from a user/group:\n\n${combinedMsg}\n\nPlease summarize the key points clearly and concisely!`;
                 
-                const aiResult = await askAI(chatId, prompt, "Kamu adalah alat peringkas chat. Jawab hanya dengan ringkasan singkat tanpa intro.");
+                const aiResult = await askAI(chatId, prompt, "You are a chat summarizer tool. Provide only the summary without any introduction.");
                 
-                let outText = `👀 *WA Read Mode & Summarize*\nDari: \`${cleanTarget}\`\n\n*Ringkasan AI:*\n${stripMarkdown(aiResult)}`;
+                let outText = `👀 *WA Read Mode & Summarize*\nFrom: \`${cleanTarget}\`\n\n*AI Summary:*\n${stripMarkdown(aiResult)}`;
                 bot.sendMessage(chatId, outText, { parse_mode: "Markdown" });
                 
-                // Clear cache
+                // Reset cache after summarizing
                 readCache[cleanTarget] = [];
                 fs.writeFileSync(cachePath, JSON.stringify(readCache, null, 2));
             } catch (e) {
-                bot.sendMessage(chatId, `❌ Gagal meringkas: ${e.message}`);
+                bot.sendMessage(chatId, `❌ Failed to summarize: ${e.message}`);
             }
             return;
         }
 
-        // --- COMMAND JADWAL ---
+        // --- SCHEDULE COMMANDS (/jadwal) ---
         if (msg.text.startsWith("/jadwal")) {
             const command = msg.text;
             const parts = command.split(' ');
@@ -668,18 +695,17 @@ bot.on("message", async (msg) => {
             try { if (fs.existsSync(schedulePath)) schedules = JSON.parse(fs.readFileSync(schedulePath, "utf-8")); } catch(e) {}
             
             if (parts[1] === "add") {
-                // format: /jadwal add Hari HH:MM [target WA] Deskripsi
-                // exp:    /jadwal add Senin 07:00 120@g.us Upacara
+                // Format: /jadwal add [Day] [HH:MM] [Target_WA_OR_none] [Description]
                 if (parts.length < 5) {
-                    bot.sendMessage(chatId, "Format: `/jadwal add [Hari] [Jam:Menit] [Target_Jika_WA] [Deskripsi]`\nContoh: `/jadwal add Senin 07:30 123@g.us Upacara Bendera` Atau ganti target dengan 'none' jika tidak ada target WA.", { parse_mode: "Markdown" });
+                    bot.sendMessage(chatId, "Usage: `/jadwal add [Day] [HH:MM] [TargetJID_OR_none] [Description]`\nExample: `/jadwal add Monday 07:30 123@g.us Flag Ceremony`. Use 'none' for TargetJID if no WhatsApp alert is needed.", { parse_mode: "Markdown" });
                     return;
                 }
-                const dayStr = parts[2].toLowerCase(); // ex: senin
-                const timeStr = parts[3]; // ex: 07:30
+                const dayStr = parts[2].toLowerCase(); 
+                const timeStr = parts[3]; 
                 const targetWa = parts[4] === "none" ? null : parts[4];
                 const desc = parts.slice(5).join(' ');
                 
-                const dayMap = { "minggu": 0, "senin": 1, "selasa": 2, "rabu": 3, "kamis": 4, "jumat": 5, "sabtu": 6 };
+                const dayMap = { "sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4, "friday": 5, "saturday": 6, "minggu": 0, "senin": 1, "selasa": 2, "rabu": 3, "kamis": 4, "jumat": 5, "sabtu": 6 };
                 const dayIdx = dayMap[dayStr] !== undefined ? dayMap[dayStr] : '*';
                 
                 let cronString = "";
@@ -687,7 +713,7 @@ bot.on("message", async (msg) => {
                 if (hh && mm) {
                     cronString = `${mm} ${hh} * * ${dayIdx}`;
                 } else {
-                    return bot.sendMessage(chatId, "Format waktu salah. Harusnya HH:MM");
+                    return bot.sendMessage(chatId, "Invalid time format. Use HH:MM");
                 }
                 
                 const newSchedule = {
@@ -701,23 +727,23 @@ bot.on("message", async (msg) => {
                 
                 schedules.push(newSchedule);
                 fs.writeFileSync(schedulePath, JSON.stringify(schedules, null, 2));
-                bot.sendMessage(chatId, `✅ Jadwal ditambahkan!\nID: ${newSchedule.id}\nHari: ${newSchedule.day} ${newSchedule.time}\nTarget: ${targetWa || 'Hanya Telegram'}\nDeskripsi: ${newSchedule.text}`);
+                bot.sendMessage(chatId, `✅ Schedule Added!\nID: ${newSchedule.id}\nDay: ${newSchedule.day} ${newSchedule.time}\nTarget: ${targetWa || 'Telegram Only'}\nDescription: ${newSchedule.text}`);
             } else if (parts[1] === "list") {
-                if (schedules.length === 0) return bot.sendMessage(chatId, "Tidak ada jadwal aktif.");
-                const listStr = schedules.map(s => `ID: ${s.id} | ${s.day} ${s.time} | Target WA: ${s.targets.length ? s.targets[0] : 'None'} | ${s.text}`).join('\n');
-                bot.sendMessage(chatId, `📅 *Daftar Jadwal:*\n${listStr}`, { parse_mode: "Markdown" });
+                if (schedules.length === 0) return bot.sendMessage(chatId, "No active schedules.");
+                const listStr = schedules.map(s => `ID: ${s.id} | ${s.day} ${s.time} | WA Target: ${s.targets.length ? s.targets[0] : 'None'} | ${s.text}`).join('\n');
+                bot.sendMessage(chatId, `📅 *Active Schedules:*\n${listStr}`, { parse_mode: "Markdown" });
             } else if (parts[1] === "delete") {
-                if (!parts[2]) return bot.sendMessage(chatId, "Masukkan ID Jadwal.");
+                if (!parts[2]) return bot.sendMessage(chatId, "Please provide the Schedule ID.");
                 const initialLen = schedules.length;
                 schedules = schedules.filter(s => s.id !== parts[2]);
                 if (schedules.length < initialLen) {
                     fs.writeFileSync(schedulePath, JSON.stringify(schedules, null, 2));
-                    bot.sendMessage(chatId, `✅ Jadwal ${parts[2]} dihapus.`);
+                    bot.sendMessage(chatId, `✅ Schedule ${parts[2]} deleted.`);
                 } else {
-                    bot.sendMessage(chatId, `⚠️ Jadwal ID ${parts[2]} tidak ditemukan.`);
+                    bot.sendMessage(chatId, `⚠️ Schedule ID ${parts[2]} not found.`);
                 }
             } else {
-                 bot.sendMessage(chatId, "Perintah tidak valid. Gunakan /jadwal add, list, atau delete.");
+                 bot.sendMessage(chatId, "Invalid command. Use /jadwal add, list, or delete.");
             }
             return;
         }
@@ -841,35 +867,34 @@ cron.schedule('* * * * *', async () => {
         const currentDay = now.getDay();
         
         for (const s of schedules) {
+            if (!s.cronString) continue;
             const [minStr, hourStr, dom, month, dow] = s.cronString.split(' ');
             
-            // Basic matching (only checks minute, hour, day of week)
-            // Asterisk means match all.
             const minMatch = minStr === '*' || parseInt(minStr) === currentMinute;
             const hourMatch = hourStr === '*' || parseInt(hourStr) === currentHour;
             const dowMatch = dow === '*' || parseInt(dow) === currentDay;
 
             if (minMatch && hourMatch && dowMatch) {
-                const message = `⏰ *PENGINGAT JADWAL/TUGAS*\n\n${s.text}`;
+                const message = `⏰ *SCHEDULE ALERT*\n\n${s.text}`;
                 
-                // Send to Telegram devId
-                bot.sendMessage(config.telegram.devId, message, { parse_mode: "Markdown" }).catch(e => logError("Failed to send schedule to Telegram:", e));
+                // Alert to Master Telegram
+                bot.sendMessage(config.telegram.devId, message, { parse_mode: "Markdown" }).catch(e => logError("Schedule failed (TG):", e));
                 
-                // Send to WA targets
+                // Alert to WA targets
                 if (s.targets && s.targets.length > 0 && waSock) {
                     for (const target of s.targets) {
                         const cleanTarget = target.includes('@') ? target : `${target}@s.whatsapp.net`;
-                        waSock.sendMessage(cleanTarget, { text: message }).catch(e => logError(`Failed to send schedule to WA ${target}:`, e));
+                        waSock.sendMessage(cleanTarget, { text: message }).catch(e => logError(`Schedule failed (WA ${target}):`, e));
                     }
                 }
                 log(`[CRON] Schedule executed: ${s.id}`);
             }
         }
     } catch(e) {
-        logError("Error on cron schedule check:", e);
+        logError("Cron schedule check failed:", e);
     }
 });
 
-log("OPENX Telegram Bot started!");
+log("OPENX Bot is ready!");
 connectToWhatsApp(bot, parseInt(config.telegram.devId));
 

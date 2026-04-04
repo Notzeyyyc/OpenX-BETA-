@@ -5,10 +5,13 @@ import fs from 'fs';
 
 const execPromise = util.promisify(exec);
 
+/**
+ * Diagnostics for the remote Android device via ADB.
+ */
 export async function getDeviceInfo() {
     let info = "[Device Info via ADB]\n";
     try {
-        // RAM
+        // RAM Diagnostics
         try {
             const { stdout: ramOut } = await execPromise('adb shell cat /proc/meminfo');
             const totalMatch = ramOut.match(/MemTotal:\s+(\d+)\s+kB/);
@@ -21,55 +24,62 @@ export async function getDeviceInfo() {
                 info += `- RAM: ${freeMb}MB Free / ${totalMb}MB Total\n`;
             }
         } catch (e) {
-            info += `- RAM: Gagal baca (/proc/meminfo)\n`;
+            info += `- RAM: Read failed (/proc/meminfo)\n`;
         }
         
-        // Kernel / OS
+        // Kernel / OS details
         try {
             const { stdout: unameOut } = await execPromise('adb shell uname -a');
             info += `- Kernel: ${unameOut.trim()}\n`;
         } catch (e) { }
 
-        // Storage (/data)
+        // Local Storage (/data partition)
         try {
             const { stdout: dfOut } = await execPromise("adb shell df -h /data");
             const lines = dfOut.trim().split('\n');
             if (lines.length > 1) {
                 const parts = lines[1].trim().split(/\s+/);
                 // Filesystem Size Used Avail Use% Mounted on
-                info += `- Storage Data: ${parts[3]} Free / ${parts[1]} Total (${parts[4]} Terpakai)\n`;
+                info += `- Storage Data: ${parts[3]} Free / ${parts[1]} Total (${parts[4]} Used)\n`;
             }
         } catch (e) {}
 
-        // Root
+        // Root Access check
         try {
             const { stdout: suOut } = await execPromise('adb shell which su');
-            if (suOut.trim().length > 0) info += `- Root: Akses SU Tersedia (${suOut.trim()})\n`;
+            if (suOut.trim().length > 0) info += `- Root: SU Access Available (${suOut.trim()})\n`;
         } catch (e) {
-            info += `- Root: Tidak terdeteksi\n`;
+            info += `- Root: Not detected\n`;
         }
 
     } catch (e) {
-        info += "Gagal terhubung ke ADB atau device tidak ada.\n";
+        info += "ADB failed or device disconnected.\n";
     }
     
     return info;
 }
 
+/**
+ * Fetches all 3rd-party apps installed on the device.
+ */
 export async function getAppList() {
     try {
         const { stdout } = await execPromise('adb shell pm list packages -3');
         const lines = stdout.trim().split('\n');
         const apps = lines.map(line => line.replace('package:', '').trim()).filter(p => p);
-        if (apps.length === 0) return "Tidak ada aplikasi pihak ketiga ditemukan.";
-        return `[Daftar Package Aplikasi Terinstal]:\n${apps.join(', ')}`;
+        if (apps.length === 0) return "No 3rd party apps found.";
+        return `[Installed App Packages]:\n${apps.join(', ')}`;
     } catch (e) {
-        return "Gagal mengambil daftar aplikasi via ADB.";
+        return "Failed to fetch app list via ADB.";
     }
 }
 
+/**
+ * Launches an application using its package name.
+ */
 export async function openApp(pkgName) {
     try {
+        // Use monkey for a simple force-launch of the main activity
         await execPromise(`adb shell monkey -p ${pkgName} -c android.intent.category.LAUNCHER 1`);
         return true;
     } catch (e) {
@@ -77,6 +87,9 @@ export async function openApp(pkgName) {
     }
 }
 
+/**
+ * Captures a high-quality screenshot from the device.
+ */
 export function takeScreenshot(outputPath) {
     return new Promise((resolve) => {
         try {
@@ -93,10 +106,12 @@ export function takeScreenshot(outputPath) {
     });
 }
 
+/**
+ * Injects text input into the active focused element on the device.
+ */
 export async function typeText(text) {
     try {
-        // ADB input text doesn't handle spaces well unless it's escaped or using %s
-        // But a more robust way for modern Android is using quotes
+        // Escaping spaces for ADB input
         const escapedText = text.replace(/ /g, '%s').replace(/'/g, "\\'");
         await execPromise(`adb shell input text "${escapedText}"`);
         return true;
@@ -105,6 +120,9 @@ export async function typeText(text) {
     }
 }
 
+/**
+ * Opens a Google search query in the device's default browser.
+ */
 export async function searchWeb(query) {
     try {
         const encodedQuery = encodeURIComponent(query);
