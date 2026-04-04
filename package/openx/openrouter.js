@@ -29,7 +29,7 @@ async function fetchModel(messages, modelName) {
     throw new Error(`Empty response from ${modelName}`);
 }
 
-export async function chatCompletion(messages, model = null) {
+export async function chatCompletion(messages, model = null, isComplex = false) {
     let modelData = { defaultModel: "minimax/minimax-m2.5:free", availableModels: [] };
     try {
         const fileContent = fs.readFileSync("./package/model.json", "utf-8");
@@ -37,7 +37,7 @@ export async function chatCompletion(messages, model = null) {
     } catch (e) {}
 
     const lastMessage = messages[messages.length - 1].content || "";
-    const isComplex = lastMessage.match(/(?:```|kode|code|kompleks|script|program|jelaskan|detail|error)/i);
+    // isComplex sekarang dipicu oleh prefix .openxc dari whatsapp.js
     
     // FITUR KOMITE MODEL (Penggabungan jika kompleks)
     if (isComplex && modelData.availableModels && modelData.availableModels.length > 1) {
@@ -51,13 +51,14 @@ export async function chatCompletion(messages, model = null) {
         
         if (validResults.length > 1) {
              const synthMessages = [
-                 { role: "system", content: "Kamu adalah AI Synthesizer. Rangkum dan gabungkan referensi jawaban dari beberapa AI menjadi satu instruksi atau solusi terbaik yang paling akurat, komprehensif, logis, tapi tetap pake bahasa gaul asik (lu/gue)." },
-                 { role: "user", content: `Pertanyaan user asli: ${lastMessage}\n\n[Jawaban AI 1]: ${validResults[0]}\n\n[Jawaban AI 2]: ${validResults[1]}\n\nBuatlah 1 jawaban paling final dari gabungan ini.` }
+                 { role: "system", content: "Kamu adalah asisten AI OPENX yang asik dan gaul. Tugasmu adalah menggabungkan beberapa poin jawaban berikut menjadi satu respons yang koheren, santai, dan solutif. Gunakan bahasa tongkrongan (lu/gue). PENTING: Jangan sertakan embel-embel seperti 'Berdasarkan jawaban AI 1', 'Hasil rangkuman:', atau meta-commentary lainnya. Langsung saja jawab ke user. Jangan kaku!" },
+                 { role: "user", content: `Konteks Pertanyaan: ${lastMessage}\n\nReferensi Jawaban:\n1. ${validResults[0]}\n2. ${validResults[1]}\n${validResults[2] ? "3. " + validResults[2] : ""}\n\nBerikan jawaban final yang paling mantap sekarang.` }
              ];
              // Fallback loop untuk nembak synthesizer-nya
              for (const m of modelData.availableModels) {
                  try {
-                     return await fetchModel(synthMessages, m);
+                     const finalResponse = await fetchModel(synthMessages, m);
+                     if (finalResponse) return finalResponse;
                  } catch(e) {}
              }
         }

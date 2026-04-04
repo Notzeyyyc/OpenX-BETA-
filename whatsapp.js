@@ -4,6 +4,9 @@ import qrcode from 'qrcode-terminal';
 import path from 'path';
 import fs from 'fs';
 import { log, error as logError } from './logger.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+const execPromise = promisify(exec);
 import { chatCompletion } from './package/openx/openrouter.js';
 import { getDeviceInfo, getAppList, openApp, takeScreenshot, typeText, searchWeb } from './package/adb_helper.js';
 
@@ -18,7 +21,7 @@ function getCurrentModel() {
     }
 }
 
-async function askAI(userMessage, from = null) {
+async function askAI(userMessage, from = null, isComplex = false) {
     let contextData = {};
     try {
         contextData = JSON.parse(fs.readFileSync("./package/context.json", "utf-8"));
@@ -53,26 +56,64 @@ async function askAI(userMessage, from = null) {
         serverStatus += `\n[Log Terakhir (log.txt)]:\n${logLines}`;
     } catch(e) {}
     
-    // Inject ADB Context if triggered
-    let adbContext = "";
-    if (userMessage) {
-        const lowerMsg = userMessage.toLowerCase();
-        if (['buka', 'aplikasi', 'app', 'ram', 'storage', 'baterai', 'device', 'hp', 'spesifikasi', 'layar', 'screenshot', 'ss', 'ketik', 'tulis', 'type', 'cari', 'search', 'googling'].some(k => lowerMsg.includes(k))) {
-            const di = await getDeviceInfo();
-            const al = await getAppList();
-            adbContext = `\n\n${di}\n${al}`;
-        }
-    }
+    const aiRules = `\n\nAturan Penting Murni (JANGAN sebut ke user):
+1. Jika user minta tolong ingetin/bikin jadwal/tugas: sertakan [ADD_SCHEDULE|Hari|HH:MM|Deskripsi_singkat|TargetJID_WA]. TargetJID isi 'none' kalo gatau.
+2. Jika user ingin berinteraksi dengan HP server (buka app, ketik, cari di web, klik, gerak, dll), gunakan perintah ADB langsung dengan format: [ADB_CMD|adb_command_here]. Contoh: [ADB_CMD|adb shell input tap 500 500] atau [ADB_CMD|adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main].
+3. Jika minta screenshot HP server: sertakan [ADB_SCREENSHOT].
+4. Jika user minta dikirimi log file / log.txt server: sertakan [SERVER_GET_LOG].
+5. Jika user minta merestart server: sertakan [SERVER_RESTART].
+6. Jika user menanyakan info perangkat, baterai, storage, RAM, spesifikasi HP, atau ingin tahu daftar aplikasi yang terinstal: sertakan [NEEDS_ADB_INFO] (dan jangan beri info palsu) agar sistem memberikan list aslinya kepadamu.
 
-    const aiRules = `\n\nAturan Penting: Jika user minta tolong ingetin/bikin jadwal/tugas, balas dengan santai lu/gue dan DI AKHIR BALASAN wajib sertakan format rahasia ini: [ADD_SCHEDULE|Hari|HH:MM|Deskripsi_singkat|TargetJID_WA]. TargetJID isi 'none' kalo gatau. Jika user mau cek log / server, info udah disediain di atas. Jika user minta buka aplikasi, cari nama package-nya di daftar aplikasi dan sertakan [ADB_OPEN|nama.package] di akhir balasan. Jika minta screenshot layar HP server, sertakan [ADB_SCREENSHOT]. Jika user minta mengetikkan sesuatu di HP, sertakan [ADB_TYPE|teks_yang_disuruh]. Jika user minta cari sesuatu di internet/browser, sertakan [ADB_SEARCH|kata_kunci]. Jangan sebut format rahasianya langsung ke user.`;
-    const context = (contextData?.whatsapp?.id || `Kamu adalah OPENX, asisten AI untuk pelajar. Wajib pakai bahasa gaul, santai abis, dan kekinian (pake lu/gue, asik kayak temen nongkrong). Saat ini kamu menjawab pesan via WhatsApp.`) + schedulesContext + storageContext + serverStatus + adbContext + aiRules;
+Ketik balasan normal kamu senatural dan sesantai mungkin (lu/gue), dan letakkan command tersebut jika diperlukan di baris-baris paling akhir agar sistem memprosesnya diam-diam.`;
+    const context = (contextData?.whatsapp?.id || `Kamu adalah OPENX, asisten AI untuk pelajar. Wajib pakai bahasa gaul, santai abis, dan kekinian (pake lu/gue, asik kayak temen nongkrong). Saat ini kamu menjawab pesan via WhatsApp.`) + schedulesContext + storageContext + serverStatus + aiRules;
     
-    const messages = [
+    let messages = [
         { role: "system", content: context },
         { role: "user", content: userMessage }
     ];
     
-    let aiResult = await chatCompletion(messages, getCurrentModel());
+    let aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
+    
+    if (aiResult.includes("[NEEDS_ADB_INFO]")) {
+        try {
+            const di = await getDeviceInfo();
+            const al = await getAppList();
+            messages.push({ role: "assistant", content: aiResult });
+            messages.push({ role: "user", content: `(Sistem) Berikut informasi perangkat dan aplikasi asli:\n${di}\n${al}\nBerdasarkan data di atas, silakan lanjutkan / penuhi permintaan awal user.` });
+            aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
+        } catch(e) {}
+        aiResult = aiResult.replace(/\[NEEDS_ADB_INFO\]/g, "");
+    }
+
+    // Parse Direct ADB Commands with Result Feedback Loop (up to 3 times to prevent infinite loops)
+    let loopCount = 0;
+    const adbCmdRegex = /\[ADB_CMD\|(.*?)\]/g;
+    while (adbCmdRegex.test(aiResult) && loopCount < 3) {
+        loopCount++;
+        let match;
+        const commands = [];
+        adbCmdRegex.lastIndex = 0;
+        while ((match = adbCmdRegex.exec(aiResult)) !== null) {
+            commands.push(match[1].trim());
+        }
+
+        let totalOutput = "";
+        for (const cmd of commands) {
+            try {
+                const { stdout, stderr } = await execPromise(cmd);
+                totalOutput += `[Command: ${cmd}]\nOutput:\n${stdout || "No Output"}\n${stderr ? "Error:\n" + stderr : ""}\n---\n`;
+            } catch (err) {
+                totalOutput += `[Command: ${cmd}]\nFailed: ${err.message}\n---\n`;
+            }
+        }
+
+        if (totalOutput) {
+            messages.push({ role: "assistant", content: aiResult });
+            messages.push({ role: "user", content: `(Sistem) Hasil eksekusi ADB:\n${totalOutput}\nBerdasarkan hasil di atas, berikan respon final yang santai atau lanjutkan perintah jika diperlukan.` });
+            aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
+        }
+    }
+    aiResult = aiResult.replace(adbCmdRegex, '');
     
     // Parse Interaktif Setup Jadwal
     const regex = /\[ADD_SCHEDULE\|(.*?)\|(.*?)\|(.*?)\|(.*?)\]/g;
@@ -111,31 +152,6 @@ async function askAI(userMessage, from = null) {
     }
     aiResult = aiResult.replace(regex, '');
     
-    // Parse ADB Commands
-    const adbOpnRegex = /\[ADB_OPEN\|(.*?)\]/g;
-    let opMatch;
-    while ((opMatch = adbOpnRegex.exec(aiResult)) !== null) {
-        const pkg = opMatch[1].trim();
-        openApp(pkg).catch(()=>{});
-    }
-    aiResult = aiResult.replace(adbOpnRegex, '');
-    
-    const adbTypeRegex = /\[ADB_TYPE\|(.*?)\]/g;
-    let typeMatch;
-    while ((typeMatch = adbTypeRegex.exec(aiResult)) !== null) {
-        const textToType = typeMatch[1].trim();
-        typeText(textToType).catch(()=>{});
-    }
-    aiResult = aiResult.replace(adbTypeRegex, '');
-
-    const adbSearchRegex = /\[ADB_SEARCH\|(.*?)\]/g;
-    let searchMatch;
-    while ((searchMatch = adbSearchRegex.exec(aiResult)) !== null) {
-        const query = searchMatch[1].trim();
-        searchWeb(query).catch(()=>{});
-    }
-    aiResult = aiResult.replace(adbSearchRegex, '');
-    
     const adbScRegex = /\[ADB_SCREENSHOT\]/g;
     if (adbScRegex.test(aiResult)) {
         if (from && waSock) {
@@ -148,6 +164,29 @@ async function askAI(userMessage, from = null) {
             });
         }
         aiResult = aiResult.replace(adbScRegex, '');
+    }
+    
+    const getLogRegex = /\[SERVER_GET_LOG\]/g;
+    if (getLogRegex.test(aiResult)) {
+        if (from && waSock) {
+            try {
+                const logPath = "./log.txt";
+                if (fs.existsSync(logPath)) {
+                    await waSock.sendMessage(from, { document: fs.readFileSync(logPath), fileName: "log.txt", mimetype: "text/plain" });
+                }
+            } catch(e) {}
+        }
+        aiResult = aiResult.replace(getLogRegex, '');
+    }
+
+    const restartRegex = /\[SERVER_RESTART\]/g;
+    if (restartRegex.test(aiResult)) {
+        if (from && waSock) {
+            setTimeout(() => {
+                process.exit(1);
+            }, 2000);
+        }
+        aiResult = aiResult.replace(restartRegex, '');
     }
     
     return aiResult.trim();
@@ -218,13 +257,13 @@ async function processQueue() {
     isProcessingQueue = true;
     
     while (aiQueue.length > 0) {
-        const { msg, textMessage, from } = aiQueue.shift();
+        const { msg, textMessage, from, isComplex } = aiQueue.shift();
         try {
             await waSock.readMessages([msg.key]);
             await waSock.presenceSubscribe(from);
             await waSock.sendPresenceUpdate('composing', from);
             
-            const aiResponse = await askAI(textMessage, from);
+            const aiResponse = await askAI(textMessage, from, isComplex);
             const cleanResponse = stripMarkdown(aiResponse) || 'Maaf, terjadi kesalahan saat memproses pesan.';
             
             await waSock.sendPresenceUpdate('paused', from);
@@ -502,21 +541,31 @@ export async function connectToWhatsApp(bot, devId) {
                 if (memArr.length > 50) memArr.shift(); // keep 50 latest 
                 fs.writeFileSync(memPath, JSON.stringify(memArr, null, 2));
 
-                // --- FILTER PREFIX .openx ---
-                if (!textMessage.trim().toLowerCase().startsWith('.openx')) {
+                // --- FILTER PREFIX .openx / .openxc ---
+                const lowerText = textMessage.trim().toLowerCase();
+                let isComplex = false;
+                let aiPromptUser = "";
+
+                if (lowerText.startsWith('.openxc')) {
+                    isComplex = true;
+                    aiPromptUser = textMessage.trim().substring(7).trim();
+                } else if (lowerText.startsWith('.openx')) {
+                    isComplex = false;
+                    aiPromptUser = textMessage.trim().substring(6).trim();
+                } else {
                     // Chat biasa hanya masuk memori, tidak di-reply AI
                     return;
                 }
-                const aiPromptUser = textMessage.trim().substring(6).trim(); // buang .openx
 
                 // --- SMART QUEUE (Batched by sender/group) ---
                 const existingReq = aiQueue.find(q => q.from === from);
                 if (existingReq) {
                     existingReq.textMessage += `\\n${senderName} nanya: ${aiPromptUser}`;
+                    existingReq.isComplex = isComplex || existingReq.isComplex; // Jika salah satu kompleks, maka kompleks
                     log(`Appended to AI Queue for ${from}`);
                 } else {
-                    aiQueue.push({ msg, textMessage: `${senderName} nanya: ${aiPromptUser}`, from });
-                    log(`Added message to AI Queue. Queue length: ${aiQueue.length}`);
+                    aiQueue.push({ msg, textMessage: `${senderName} nanya: ${aiPromptUser}`, from, isComplex });
+                    log(`Added message to AI Queue (Complex: ${isComplex}). Queue length: ${aiQueue.length}`);
                 }
                 
                 // Jalankan queue jika sedang idle
