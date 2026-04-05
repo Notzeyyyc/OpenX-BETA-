@@ -49,7 +49,7 @@ async function fetchModel(messages, modelName, apiKey = getActiveKey()) {
 
     const data = await response.json();
     if (data.choices && data.choices[0] && data.choices[0].message) {
-        return data.choices[0].message.content;
+        return data.choices[0].message.content || "";
     }
     throw new Error(`Empty response from ${modelName}`);
 }

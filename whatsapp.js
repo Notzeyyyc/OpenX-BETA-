@@ -8,7 +8,8 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 const execPromise = promisify(exec);
 import { chatCompletion } from './package/openx/openrouter.js';
-import { getDeviceInfo, getAppList, takeScreenshot } from './package/adb_helper.js';
+import { getDeviceInfo, getAppList, takeScreenshot, sendNotification, getHealthStatus } from './package/adb_helper.js';
+import { downloadMedia } from './package/downloader.js';
 
 let targetModel = "stepfun/step-3.5-flash:free";
 
@@ -69,20 +70,33 @@ async function askAI(userMessage, from = null, isComplex = false) {
 1. Untuk pengingat/jadwal: sertakan [ADD_SCHEDULE|Hari|HH:MM|Deskripsi|TargetWA_JID]. Gunakan 'none' jika Target WA tidak diketahui.
 2. Untuk interaksi HP server (buka app, ketik, tap, dsb), gunakan perintah ADB langsung: [ADB_CMD|perintah_adb]. Contoh: [ADB_CMD|adb shell input tap 500 500].
 3. Untuk screenshot layar: sertakan [ADB_SCREENSHOT].
-4. Untuk log server: sertakan [SERVER_GET_LOG].
-5. Untuk restart server: sertakan [SERVER_RESTART].
-6. Untuk info perangkat/aplikasi: sertakan [NEEDS_ADB_INFO] biar gue bisa kasih data real.
+4. Untuk kirim notifikasi ke HP: sertakan [ADB_NOTIFY|Judul|Pesan].
+5. Untuk cek kesehatan HP (baterai, suhu, dll): sertakan [ADB_HEALTH].
+6. Untuk chat ke orang lain di WhatsApp: sertakan [WA_SEND|nomor_atau_jid|pesan_ai]. Pastikan nomor pake format internasional (628...).
+7. Untuk log server: sertakan [SERVER_GET_LOG].
+8. Untuk restart server: sertakan [SERVER_RESTART].
+9. Untuk info perangkat/aplikasi: sertakan [NEEDS_ADB_INFO] biar gue bisa kasih data real.
+10. Untuk download video/foto/audio sosmed (TikTok, IG, YT, dll): sertakan [DOWNLOAD_MEDIA|URL].
 
-Balas dengan gaya bahasa yang natural, santai banget, pake lu/gue biar kayak temen deket. Taro tag perintah di paling akhir balasan.`;
+PENTING: Balas dengan gaya bahasa sesuai kepribadian lu yang sudah ditentukan di atas. Taro tag perintah di paling akhir balasan secara tersembunyi.`;
 
-    const systemPrompt = (contextData?.whatsapp?.id || `Lu adalah OPENX, asisten AI khusus buat pelajar. Wajib banget pake bahasa indonesia gaul, santai, pake lu/gue, chill abis, dan asik. Saat ini lu lagi chat via WhatsApp.`) + schedulesContext + storageContext + serverStatus + aiRules;
+    // Load personality settings
+    let personalities = { active: "default", profiles: {} };
+    try {
+        personalities = JSON.parse(fs.readFileSync("./package/personalities.json", "utf-8"));
+    } catch (e) {}
+    
+    const activeProfile = personalities.profiles[personalities.active] || personalities.profiles["default"];
+    const personalityPrompt = activeProfile ? activeProfile.prompt : "Lu adalah OPENX, asisten AI khusus buat pelajar.";
+
+    const systemPrompt = personalityPrompt + schedulesContext + storageContext + serverStatus + aiRules;
     
     let messages = [
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage }
     ];
     
-    let aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
+    let aiResult = await chatCompletion(messages, getCurrentModel(), isComplex) || "";
     
     // Handle dynamic ADB info request
     if (aiResult.includes("[NEEDS_ADB_INFO]")) {
@@ -92,6 +106,7 @@ Balas dengan gaya bahasa yang natural, santai banget, pake lu/gue biar kayak tem
             messages.push({ role: "assistant", content: aiResult });
             messages.push({ role: "user", content: `(System) Real device and app info:\n${di}\n${al}\nNow, fulfill the user request using this real data.` });
             aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
+            if (!aiResult) aiResult = "";
         } catch(e) {}
         aiResult = aiResult.replace(/\[NEEDS_ADB_INFO\]/g, "");
     }
@@ -122,6 +137,7 @@ Balas dengan gaya bahasa yang natural, santai banget, pake lu/gue biar kayak tem
             messages.push({ role: "assistant", content: aiResult });
             messages.push({ role: "user", content: `(System) ADB Results:\n${totalOutput}\nRespond naturally or continue commands if needed.` });
             aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
+            if (!aiResult) aiResult = "";
         }
     }
     aiResult = aiResult.replace(adbCmdRegex, '');
@@ -203,6 +219,54 @@ Balas dengan gaya bahasa yang natural, santai banget, pake lu/gue biar kayak tem
         }
         aiResult = aiResult.replace(restartRegex, '');
     }
+    
+    // ADB Notification Handler
+    const adbNotifyRegex = /\[ADB_NOTIFY\|(.*?)\|(.*?)\]/g;
+    let notifyMatch;
+    while ((notifyMatch = adbNotifyRegex.exec(aiResult)) !== null) {
+        sendNotification(notifyMatch[1], notifyMatch[2]).catch(() => {});
+    }
+    aiResult = aiResult.replace(adbNotifyRegex, '');
+
+    // ADB Health Handler
+    if (aiResult.includes("[ADB_HEALTH]")) {
+        try {
+            const healthReport = await getHealthStatus();
+            messages.push({ role: "assistant", content: aiResult });
+            messages.push({ role: "user", content: `(System) Real Health Info:\n${healthReport}\nTell the user about this health status naturally.` });
+            aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
+            if (!aiResult) aiResult = "";
+        } catch(e) {}
+        aiResult = aiResult.replace(/\[ADB_HEALTH\]/g, "");
+    }
+
+    // WA Send/Chat to someone else
+    const waSendRegex = /\[WA_SEND\|(.*?)\|(.*?)\]/g;
+    let waMatch;
+    while ((waMatch = waSendRegex.exec(aiResult)) !== null) {
+        if (waSock) {
+            let target = waMatch[1].trim();
+            const text = waMatch[2].trim();
+            if (!target.includes('@')) target = target + '@s.whatsapp.net';
+            waSock.sendMessage(target, { text }).catch(() => {});
+        }
+    }
+    aiResult = aiResult.replace(waSendRegex, '');
+
+    // DOWNLOAD_MEDIA Tag Handler
+    const dlRegex = /\[DOWNLOAD_MEDIA\|(.*?)\]/g;
+    let dlMatch;
+    while ((dlMatch = dlRegex.exec(aiResult)) !== null) {
+        const url = dlMatch[1].trim();
+        downloadMedia(url).then(async (res) => {
+            if (from && waSock) {
+                if (res.type === "video") await waSock.sendMessage(from, { video: res.buffer, fileName: res.filename });
+                else if (res.type === "audio") await waSock.sendMessage(from, { audio: res.buffer, fileName: res.filename });
+                else await waSock.sendMessage(from, { document: res.buffer, fileName: res.filename, mimetype: "application/octet-stream" });
+            }
+        }).catch(err => logError(`Download failed for ${url}:`, err));
+    }
+    aiResult = aiResult.replace(dlRegex, '');
     
     return aiResult.trim();
 }
@@ -561,6 +625,98 @@ export async function connectToWhatsApp(bot, devId) {
 
                 // --- AI TRIGGER FILTER (.openx / .openxc) ---
                 const lowerText = textMessage.trim().toLowerCase();
+                // --- PERSONALITY COMMANDS ---
+                if (lowerText.startsWith('.personality')) {
+                    let personalities = { active: "default", profiles: {} };
+                    try { personalities = JSON.parse(fs.readFileSync("./package/personalities.json", "utf-8")); } catch(e){}
+                    
+                    const args = textMessage.split(' ');
+                    const subCommand = args[1]?.toLowerCase();
+                    
+                    if (subCommand === 'list') {
+                        let listMsg = "🎭 *Available Personalities:*\n\n";
+                        for (const key in personalities.profiles) {
+                            const p = personalities.profiles[key];
+                            listMsg += `${key === personalities.active ? '✅' : '▪️'} *${key}*: ${p.name}\n`;
+                        }
+                        listMsg += "\nUse `.personality select [key]` to switch.";
+                        await waSock.sendMessage(from, { text: listMsg }, { quoted: msg });
+                    } 
+                    else if (subCommand === 'select') {
+                        const key = args[2]?.toLowerCase();
+                        if (personalities.profiles[key]) {
+                            personalities.active = key;
+                            fs.writeFileSync("./package/personalities.json", JSON.stringify(personalities, null, 2));
+                            await waSock.sendMessage(from, { text: `✅ Personality swapped to: *${personalities.profiles[key].name}*` }, { quoted: msg });
+                        } else {
+                            await waSock.sendMessage(from, { text: `❌ Personality *${key}* not found.` }, { quoted: msg });
+                        }
+                    }
+                    else if (subCommand === 'add') {
+                        // Format: .personality add name | prompt
+                        const content = textMessage.substring(16).trim();
+                        const [name, ...promptParts] = content.split('|');
+                        const prompt = promptParts.join('|').trim();
+                        const key = name.trim().toLowerCase().replace(/\s+/g, '_');
+                        
+                        if (key && prompt) {
+                            personalities.profiles[key] = { name: name.trim(), prompt: prompt };
+                            fs.writeFileSync("./package/personalities.json", JSON.stringify(personalities, null, 2));
+                            await waSock.sendMessage(from, { text: `✨ New personality added: *${name.trim()}* (key: ${key})` }, { quoted: msg });
+                        } else {
+                            await waSock.sendMessage(from, { text: "❌ Format: `.personality add Name | Prompt Text`" }, { quoted: msg });
+                        }
+                    }
+                    else if (subCommand === 'delete') {
+                        const key = args[2]?.toLowerCase();
+                        if (key === 'default') return await waSock.sendMessage(from, { text: "❌ Cannot delete default personality." });
+                        if (personalities.profiles[key]) {
+                            delete personalities.profiles[key];
+                            if (personalities.active === key) personalities.active = 'default';
+                            fs.writeFileSync("./package/personalities.json", JSON.stringify(personalities, null, 2));
+                            await waSock.sendMessage(from, { text: `🗑️ Personality *${key}* deleted.` }, { quoted: msg });
+                        } else {
+                            await waSock.sendMessage(from, { text: `❌ Personality *${key}* not found.` }, { quoted: msg });
+                        }
+                    }
+                    else {
+                        await waSock.sendMessage(from, { text: "❓ *Personality Commands:*\n.personality list\n.personality select [key]\n.personality add [Name] | [Prompt]\n.personality delete [key]" }, { quoted: msg });
+                    }
+                    return;
+                }
+
+                // --- MODEL COMMANDS ---
+                if (lowerText.startsWith('.model')) {
+                    const args = textMessage.split(' ');
+                    const subCommand = args[1]?.toLowerCase();
+                    let modelData = { defaultModel: "", availableModels: [] };
+                    try { modelData = JSON.parse(fs.readFileSync("./package/model.json", "utf-8")); } catch(e){}
+
+                    if (subCommand === 'list') {
+                        let listMsg = "🤖 *Available AI Models:*\n\n";
+                        modelData.availableModels.forEach(m => {
+                            listMsg += `${m === modelData.defaultModel ? '✅' : '▪️'} ${m}\n`;
+                        });
+                        listMsg += "\nUse `.model select [NAME]` to switch.";
+                        await waSock.sendMessage(from, { text: listMsg }, { quoted: msg });
+                    }
+                    else if (subCommand === 'select') {
+                        const newModel = args[2]?.toLowerCase();
+                        const found = modelData.availableModels.find(m => m.toLowerCase() === newModel);
+                        if (found) {
+                            modelData.defaultModel = found;
+                            fs.writeFileSync("./package/model.json", JSON.stringify(modelData, null, 2));
+                            await waSock.sendMessage(from, { text: `✅ AI Model swapped to: *${found}*` }, { quoted: msg });
+                        } else {
+                            await waSock.sendMessage(from, { text: `❌ Model *${newModel}* not found in list.` }, { quoted: msg });
+                        }
+                    }
+                    else {
+                        await waSock.sendMessage(from, { text: "❓ *Model Commands:*\n.model list\n.model select [NAME]" }, { quoted: msg });
+                    }
+                    return;
+                }
+
                 let isComplex = false;
                 let aiPromptUser = "";
 

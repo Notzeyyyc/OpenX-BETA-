@@ -6,7 +6,13 @@ import { chatCompletion } from "./package/openx/openrouter.js";
 import { log, error as logError } from "./logger.js";
 import { connectToWhatsApp, waSock } from "./whatsapp.js";
 import cron from "node-cron";
-import { getDeviceInfo, getAppList, openApp, takeScreenshot, typeText, searchWeb } from './package/adb_helper.js';
+import { getDeviceInfo, getAppList, openApp, takeScreenshot, typeText, searchWeb, sendNotification, getHealthStatus } from './package/adb_helper.js';
+import { exec } from 'child_process';
+import util from 'util';
+import { downloadMedia } from './package/downloader.js';
+
+const execPromise = util.promisify(exec);
+import { detectAdbPort } from './adb_connect.js';
 
 const bot = new TelegramBot(config.telegram.token, { polling: true });
 const USER_LANGS = new Map();
@@ -169,12 +175,16 @@ async function askAI(chatId, userMessage, systemContext = null) {
         contextData = JSON.parse(fs.readFileSync("./package/context.json", "utf-8"));
     } catch {}
 
-    const defaultContextStr = contextData?.telegram?.[lang] || 
-        (lang === 'id' 
-            ? "Lu adalah OPENX, asisten AI khusus buat pelajar. Wajib banget pake bahasa indonesia gaul, santai, pake lu/gue, chill abis, dan asik kayak temen nongkrong tongkrongan.\nInfo user:\n- Chat ID: {chatId}\n- File tersimpan: {fileList}"
-            : "You are OPENX, an AI assistant for Indonesian students.\nUser info:\n- Chat ID: {chatId}\n- Saved files: {fileList}");
+    // Load global personality
+    let personalities = { active: "default", profiles: {} };
+    try {
+        personalities = JSON.parse(fs.readFileSync("./package/personalities.json", "utf-8"));
+    } catch (e) {}
     
-    let resolvedContext = defaultContextStr.replace("{chatId}", chatId).replace("{fileList}", fileList);
+    const activeProfile = personalities.profiles[personalities.active] || personalities.profiles["default"];
+    const personalityPrompt = activeProfile ? activeProfile.prompt : "Lu adalah OPENX, asisten AI khusus buat pelajar.";
+    
+    let resolvedContext = personalityPrompt.replace("{chatId}", chatId).replace("{fileList}", fileList);
     
     // Fetch schedule context
     let schedulesContext = "";
@@ -229,9 +239,12 @@ async function askAI(chatId, userMessage, systemContext = null) {
 2. Untuk log server / status: infokan berdasarkan context dari system ini.
 3. Untuk buka aplikasi: cari nama package-nya di daftar aplikasi dan sertakan [ADB_OPEN|nama.package].
 4. Untuk screenshot: sertakan [ADB_SCREENSHOT].
-5. Untuk mengetik: sertakan [ADB_TYPE|teks_yang_diketik].
-6. Untuk mencari di web: sertakan [ADB_SEARCH|query].
-Bawaannya santai aja, jangan pernah sebut tag mentah di atas langsung ke user.`;
+5. Untuk kirim notifikasi ke HP: sertakan [ADB_NOTIFY|Judul|Pesan].
+6. Untuk cek kesehatan HP (baterai, suhu, dll): sertakan [ADB_HEALTH].
+7. Untuk chat ke orang lain di WhatsApp: sertakan [WA_SEND|nomor_atau_jid|pesan_ai]. Pastikan nomor pake format internasional (628...).
+8. Untuk mengetik: sertakan [ADB_TYPE|teks_yang_diketik].
+9. Untuk mencari di web: sertakan [ADB_SEARCH|query].
+Bawaannya sesuaikan sama kepribadian di atas, taro tag di akhir balasan.`;
     
     const context = systemContext || (resolvedContext + aiRules);
     
@@ -241,6 +254,7 @@ Bawaannya santai aja, jangan pernah sebut tag mentah di atas langsung ke user.`;
     ];
     
     let aiResult = await chatCompletion(contextMessages, getCurrentModel());
+    if (!aiResult) aiResult = "";
     
     // Handle Schedule Tag
     const regex = /\[ADD_SCHEDULE\|(.*?)\|(.*?)\|(.*?)\|(.*?)\]/g;
@@ -318,6 +332,54 @@ Bawaannya santai aja, jangan pernah sebut tag mentah di atas langsung ke user.`;
         aiResult = aiResult.replace(adbScRegex, '');
     }
     
+    // ADB Notification Handler
+    const adbNotifyRegex = /\[ADB_NOTIFY\|(.*?)\|(.*?)\]/g;
+    let notifyMatch;
+    while ((notifyMatch = adbNotifyRegex.exec(aiResult)) !== null) {
+        sendNotification(notifyMatch[1], notifyMatch[2]).catch(() => {});
+    }
+    aiResult = aiResult.replace(adbNotifyRegex, '');
+
+    // ADB Health Handler
+    if (aiResult.includes("[ADB_HEALTH]")) {
+        try {
+            const healthReport = await getHealthStatus();
+            contextMessages.push({ role: "assistant", content: aiResult });
+            contextMessages.push({ role: "user", content: `(System) Real Health Info:\n${healthReport}\nTell the user about this health status naturally.` });
+            aiResult = await chatCompletion(contextMessages, getCurrentModel());
+            if (!aiResult) aiResult = "";
+        } catch(e) {}
+        aiResult = aiResult.replace(/\[ADB_HEALTH\]/g, "");
+    }
+
+    // WA Send/Chat to someone else
+    const waSendRegex = /\[WA_SEND\|(.*?)\|(.*?)\]/g;
+    let waMatch;
+    while ((waMatch = waSendRegex.exec(aiResult)) !== null) {
+        if (waSock) {
+            let target = waMatch[1].trim();
+            const text = waMatch[2].trim();
+            if (!target.includes('@')) target = target + '@s.whatsapp.net';
+            waSock.sendMessage(target, { text }).catch(() => {});
+        }
+    }
+    aiResult = aiResult.replace(waSendRegex, '');
+
+    // DOWNLOAD_MEDIA Tag Handler
+    const dlRegex = /\[DOWNLOAD_MEDIA\|(.*?)\]/g;
+    let dlMatch;
+    while ((dlMatch = dlRegex.exec(aiResult)) !== null) {
+        const url = dlMatch[1].trim();
+        downloadMedia(url).then(async (res) => {
+            if (chatId) {
+                if (res.type === "video") await bot.sendVideo(chatId, res.buffer);
+                else if (res.type === "audio") await bot.sendAudio(chatId, res.buffer);
+                else await bot.sendDocument(chatId, res.buffer, {}, { filename: res.filename });
+            }
+        }).catch(err => logError(`Download failed for ${url}:`, err));
+    }
+    aiResult = aiResult.replace(dlRegex, '');
+    
     return aiResult.trim();
 }
 
@@ -358,6 +420,63 @@ bot.onText(/\/start/, async (msg) => {
         logError(error);
         await bot.deleteMessage(chatId, waitMsg.message_id);
         bot.sendMessage(chatId, t(chatId, "welcome", username, getCurrentModel()));
+    }
+});
+
+bot.onText(/\/personality/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!isAuthorized(chatId)) return;
+
+    const args = msg.text.split(' ');
+    const subCommand = args[1]?.toLowerCase();
+    let personalities = { active: "default", profiles: {} };
+    try { personalities = JSON.parse(fs.readFileSync("./package/personalities.json", "utf-8")); } catch(e){}
+
+    if (!subCommand) {
+        return bot.sendMessage(chatId, "🎭 *Personality Commands:*\n/personality list\n/personality select [key]\n/personality add [Name] | [Prompt]\n/personality delete [key]", { parse_mode: "Markdown" });
+    }
+
+    if (subCommand === 'list') {
+        let listMsg = "🎭 *Available Personalities:*\n\n";
+        for (const key in personalities.profiles) {
+            const p = personalities.profiles[key];
+            listMsg += `${key === personalities.active ? '✅' : '▪️'} *${key}*: ${p.name}\n`;
+        }
+        bot.sendMessage(chatId, listMsg, { parse_mode: "Markdown" });
+    } else if (subCommand === 'select') {
+        const key = args[2]?.toLowerCase();
+        if (personalities.profiles[key]) {
+            personalities.active = key;
+            fs.writeFileSync("./package/personalities.json", JSON.stringify(personalities, null, 2));
+            bot.sendMessage(chatId, `✅ Personality swapped to: *${personalities.profiles[key].name}*`);
+        } else {
+            bot.sendMessage(chatId, `❌ Personality *${key}* not found.`);
+        }
+    } else if (subCommand === 'add') {
+        const content = msg.text.split('|');
+        if (content.length < 2) return bot.sendMessage(chatId, "❌ Format: `/personality add Name | Prompt Text`", { parse_mode: "Markdown" });
+        const namePart = msg.text.substring(17).split('|')[0].trim();
+        const promptPart = msg.text.substring(17).split('|').slice(1).join('|').trim();
+        const key = namePart.toLowerCase().replace(/\s+/g, '_');
+        
+        if (key && promptPart) {
+            personalities.profiles[key] = { name: namePart, prompt: promptPart };
+            fs.writeFileSync("./package/personalities.json", JSON.stringify(personalities, null, 2));
+            bot.sendMessage(chatId, `✨ New personality added: *${namePart}* (key: ${key})`);
+        } else {
+            bot.sendMessage(chatId, "❌ Format: `/personality add Name | Prompt Text`", { parse_mode: "Markdown" });
+        }
+    } else if (subCommand === 'delete') {
+        const key = args[2]?.toLowerCase();
+        if (key === 'default') return bot.sendMessage(chatId, "❌ Cannot delete default personality.");
+        if (personalities.profiles[key]) {
+            delete personalities.profiles[key];
+            if (personalities.active === key) personalities.active = 'default';
+            fs.writeFileSync("./package/personalities.json", JSON.stringify(personalities, null, 2));
+            bot.sendMessage(chatId, `🗑️ Personality *${key}* deleted.`);
+        } else {
+            bot.sendMessage(chatId, `❌ Personality *${key}* not found.`);
+        }
     }
 });
 
@@ -896,5 +1015,22 @@ cron.schedule('* * * * *', async () => {
 });
 
 log("OPENX Bot is ready!");
+
+async function connectADB() {
+    if (!config.adbPort) return;
+    if (config.adbPort === "auto") {
+        await detectAdbPort();
+        return;
+    }
+    log(`⏳ Auto-connecting to localhost:${config.adbPort}...`);
+    try {
+        const { stdout } = await execPromise(`adb connect localhost:${config.adbPort}`);
+        log(`✅ ADB: ${stdout.trim()}`);
+    } catch (e) {
+        logError("ADB Auto-connect failed:", e);
+    }
+}
+
+connectADB();
 connectToWhatsApp(bot, parseInt(config.telegram.devId));
 

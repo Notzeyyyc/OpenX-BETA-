@@ -134,4 +134,59 @@ export async function searchWeb(query) {
     }
 }
 
+/**
+ * Sends a system notification to the Android device.
+ */
+export async function sendNotification(title, message) {
+    try {
+        const escapedTitle = title.replace(/"/g, '\\"');
+        const escapedMsg = message.replace(/"/g, '\\"');
+        // Works on Android 7.0+
+        await execPromise(`adb shell cmd notification post -S big_text -t "${escapedTitle}" tag1 "${escapedMsg}"`);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
 
+/**
+ * Fetches detailed health status (battery, thermal, and storage).
+ */
+export async function getHealthStatus() {
+    let health = "[Device Health Report]\n";
+    try {
+        // Battery Info
+        try {
+            const { stdout: batOut } = await execPromise('adb shell dumpsys battery');
+            const levelMatch = batOut.match(/level:\s+(\d+)/);
+            const tempMatch = batOut.match(/temperature:\s+(\d+)/);
+            const statusMatch = batOut.match(/status:\s+(\d+)/);
+            
+            if (levelMatch) health += `🔋 Battery: ${levelMatch[1]}%\n`;
+            if (tempMatch) health += `🌡️ Temp: ${(parseInt(tempMatch[1]) / 10).toFixed(1)}°C\n`;
+            
+            const statuses = { 1: "Unknown", 2: "Charging", 3: "Discharging", 4: "Not Charging", 5: "Full" };
+            if (statusMatch) health += `⚡ Status: ${statuses[statusMatch[1]] || "Unknown"}\n`;
+        } catch (e) { health += "🔋 Battery: (Read Failed)\n"; }
+
+        // Storage Info
+        try {
+            const { stdout: dfOut } = await execPromise("adb shell df -h /data");
+            const lines = dfOut.trim().split('\n');
+            if (lines.length > 1) {
+                const parts = lines[1].trim().split(/\s+/);
+                health += `💾 Storage: ${parts[3]} Free / ${parts[1]} Total (${parts[4]} Used)\n`;
+            }
+        } catch (e) {}
+
+        // Uptime
+        try {
+            const { stdout: upOut } = await execPromise("adb shell uptime");
+            health += `⏱️ Uptime: ${upOut.trim()}\n`;
+        } catch (e) {}
+
+    } catch (e) {
+        health += "ADB failed or device disconnected.\n";
+    }
+    return health;
+}
