@@ -10,6 +10,8 @@ const execPromise = promisify(exec);
 import { chatCompletion } from './package/openx/openrouter.js';
 import { getDeviceInfo, getAppList, takeScreenshot, sendNotification, getHealthStatus } from './package/adb_helper.js';
 import { downloadMedia } from './package/downloader.js';
+import { config } from './config.js';
+import { initModules, handleMessage as moduleHandleMessage } from './modules/index.mjs';
 
 let targetModel = "stepfun/step-3.5-flash:free";
 
@@ -276,7 +278,7 @@ function stripMarkdown(text) {
     if (!text) return text;
     return text
         .replace(/\*\*/g, '')
-        .replace(/\*/g, '')
+        .replace(/\*\*/g, '')
         .replace(/__/g, '')
         .replace(/_/g, '')
         .replace(/`/g, '')
@@ -366,7 +368,7 @@ async function processQueue() {
 }
 
 // WhatsApp Connection Logic
-export async function connectToWhatsApp(bot, devId) {
+export async function connectToWhatsApp() {
     log('Attempting to connect to WhatsApp...');
     
     const { state, saveCreds } = await useMultiFileAuthState('caches/baileys_auth_info');
@@ -400,6 +402,12 @@ export async function connectToWhatsApp(bot, devId) {
             }
         } else if (connection === 'open') {
             log('Successfully connected to WhatsApp!');
+
+            // Initialise OpenX module system
+            const adminJid = config.devPhoneNumber.includes('@')
+                ? config.devPhoneNumber
+                : `${config.devPhoneNumber}@s.whatsapp.net`;
+            initModules(adminJid, (jid, msg) => waSock.sendMessage(jid, msg));
             
             // Interval Auto-Post ke Admin Channels (1 jam)
             setInterval(async () => {
@@ -441,34 +449,15 @@ export async function connectToWhatsApp(bot, devId) {
                 const cleanParticipant = participant.replace('@s.whatsapp.net', '');
                 
                 if (waConfig.statusTargets.includes(cleanParticipant) || waConfig.statusTargets.includes(participant)) {
-                    log(`Received monitored status from ${participant}`);
-                    if (!bot || !devId) return;
-
+                    log(`[Status Monitor] Received status from ${participant}. Content logged to log.txt.`);
                     let textMsg = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-                    const isMediaMsg = msg.message.imageMessage || msg.message.videoMessage;
-                    let senderName = msg.pushName || cleanParticipant;
-                    let cap = `🟢 *Monitored WA Status*\nFrom: ${senderName} (\`${cleanParticipant}\`)`;
-                    if (textMsg) cap += `\n\nContent: ${textMsg}`;
-
-                    if (isMediaMsg) {
-                        try {
-                            const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: waSock.updateMediaMessage });
-                            if (msg.message.imageMessage) {
-                                await bot.sendPhoto(devId, buffer, { caption: cap, parse_mode: 'Markdown' });
-                            } else if (msg.message.videoMessage) {
-                                await bot.sendVideo(devId, buffer, { caption: cap, parse_mode: 'Markdown' });
-                            }
-                        } catch (e) {
-                            bot.sendMessage(devId, cap + `\n\n_(Failed to download status media)_`, { parse_mode: 'Markdown' });
-                        }
-                    } else {
-                        bot.sendMessage(devId, cap, { parse_mode: 'Markdown' });
-                    }
+                    const senderName = msg.pushName || cleanParticipant;
+                    log(`🟢 WA Status from ${senderName} (${cleanParticipant}): ${textMsg || '(Media Only)'}`);
                 }
                 return;
             }
 
-            // 2. MONITOR CHANNEL MESSAGES (Newsletters) & ADD AI OPINION
+            // 2. MONITOR CHANNEL MESSAGES (Newsletters)
             if (from.endsWith('@newsletter')) {
                 if (msg.key.fromMe) return;
                 
@@ -483,25 +472,12 @@ export async function connectToWhatsApp(bot, devId) {
                     readCache[from].push(`[${new Date().toLocaleTimeString('id-ID')}] Channel: ${textMsg}`);
                     if (readCache[from].length > 100) readCache[from].shift();
                     fs.writeFileSync("./package/wa_read_cache.json", JSON.stringify(readCache, null, 2));
-                    return; // Collecting only, don't forward
+                    return; 
                 }
                 
-                if (bot && devId) {
-                    let aiOpinion = "No text content found.";
-                    if (textMsg) {
-                        try {
-                            const opinionContext = `Provide a critical, sharp, or funny comment (1-2 sentences) about this news/info:\n"${textMsg}"`;
-                            aiOpinion = await askAI(opinionContext);
-                        } catch(e) {}
-                    }
-                    
-                    let forwardFormat = `📰 *WhatsApp Channel Update*\nChannel ID: \`${from}\``;
-                    if (textMsg) forwardFormat += `\n\n*Original Content:*\n${textMsg}`;
-                    forwardFormat += `\n\n🤖 *OpenX AI Comment:*\n🗣 _${stripMarkdown(aiOpinion)}_`;
-                    
-                    bot.sendMessage(devId, forwardFormat, { parse_mode: "Markdown" });
-                }
-                return; // End channel logic
+                log(`[Channel Monitor] New update from ${from}. Content logged to log.txt.`);
+                log(`📰 Channel ${from} update: ${textMsg}`);
+                return; 
             }
 
             // 3. REGULAR CHAT LOGIC (DM / Groups)
@@ -545,7 +521,7 @@ export async function connectToWhatsApp(bot, devId) {
                         const aiAnsw = await askAI(`User pulled File ID ${fileIdNum} but it's missing. Tell them casually (lu/gue) that I can't find it.`);
                         await waSock.sendMessage(from, { text: stripMarkdown(aiAnsw) || "Oops, couldn't find that File ID. Double check it!" });
                     }
-                    return; // End file retrieval
+                    return; 
                 }
                 
                 // 3a. CHECK READ MODE FOR DMS / GROUPS
@@ -563,35 +539,7 @@ export async function connectToWhatsApp(bot, devId) {
                     if (readCache[from].length > 100) readCache[from].shift();
                     fs.writeFileSync("./package/wa_read_cache.json", JSON.stringify(readCache, null, 2));
                     
-                    return; // Don't reply via AI
-                }
-                
-                // Forward DM messages to Telegram
-                if (!isGroup && bot && devId) {
-                    const senderName = msg.pushName;
-                    let telegramMsg = `📩 *From WhatsApp*\nID: \`${from}\``;
-                    
-                    if (senderName) {
-                        telegramMsg += `\nName: ${senderName}`;
-                    } else {
-                        telegramMsg += `\nName: _(No Name)_`;
-                    }
-                    telegramMsg += `\n\nMessage: ${textMessage}`;
-                    
-                    let picSent = false;
-                    if (!senderName) {
-                        try {
-                            const ppUrl = await waSock.profilePictureUrl(from, 'image').catch(() => null);
-                            if (ppUrl) {
-                                await bot.sendPhoto(devId, ppUrl, { caption: telegramMsg, parse_mode: "Markdown" });
-                                picSent = true;
-                            }
-                        } catch (e) { }
-                    }
-                    
-                    if (!picSent) {
-                        bot.sendMessage(devId, telegramMsg, { parse_mode: "Markdown" });
-                    }
+                    return; 
                 }
                 
                 // Group Whitelist Check
@@ -599,14 +547,6 @@ export async function connectToWhatsApp(bot, devId) {
                     let waConfig = {};
                     try { waConfig = JSON.parse(fs.readFileSync("./package/wa_config.json", "utf-8")); } catch(e) {}
                     let allowedGroups = waConfig.allowedGroups || [];
-                    
-                    // Auto-whitelist specific group ID if needed
-                    const TARGET_GROUP = "120363402992623966@g.us";
-                    if (!allowedGroups.includes(TARGET_GROUP)) {
-                        allowedGroups.push(TARGET_GROUP);
-                        waConfig.allowedGroups = allowedGroups;
-                        fs.writeFileSync("./package/wa_config.json", JSON.stringify(waConfig, null, 2));
-                    }
                     
                     if (!allowedGroups.includes(from)) {
                         log(`Ignored group message from ${from}`);
@@ -623,7 +563,7 @@ export async function connectToWhatsApp(bot, devId) {
                 if (memArr.length > 50) memArr.shift();
                 fs.writeFileSync(memPath, JSON.stringify(memArr, null, 2));
 
-                // --- AI TRIGGER FILTER (.openx / .openxc) ---
+                // --- AI TRIGGER FILTER ---
                 const lowerText = textMessage.trim().toLowerCase();
                 // --- PERSONALITY COMMANDS ---
                 if (lowerText.startsWith('.personality')) {
@@ -653,7 +593,6 @@ export async function connectToWhatsApp(bot, devId) {
                         }
                     }
                     else if (subCommand === 'add') {
-                        // Format: .personality add name | prompt
                         const content = textMessage.substring(16).trim();
                         const [name, ...promptParts] = content.split('|');
                         const prompt = promptParts.join('|').trim();
@@ -717,6 +656,10 @@ export async function connectToWhatsApp(bot, devId) {
                     return;
                 }
 
+                // ── OpenX Module System hook (runs before AI prefix check) ──
+                const moduleHandled = await moduleHandleMessage(from, textMessage.trim());
+                if (moduleHandled) return;
+
                 let isComplex = false;
                 let aiPromptUser = "";
 
@@ -727,42 +670,23 @@ export async function connectToWhatsApp(bot, devId) {
                     isComplex = false;
                     aiPromptUser = textMessage.trim().substring(6).trim();
                 } else {
-                    // Normal chat just goes to memory
                     return;
                 }
 
-                // --- SMART QUEUE (Batched by sender/group) ---
+                // --- SMART QUEUE ---
                 const existingReq = aiQueue.find(q => q.from === from);
                 if (existingReq) {
                     existingReq.textMessage += `\n${senderName} asked: ${aiPromptUser}`;
-                    existingReq.isComplex = isComplex || existingReq.isComplex; // If any part is complex, the whole response is
+                    existingReq.isComplex = isComplex || existingReq.isComplex; 
                     log(`Appended to AI Queue for ${from}`);
                 } else {
                     aiQueue.push({ msg, textMessage: `${senderName} asked: ${aiPromptUser}`, from, isComplex });
                     log(`Added message to AI Queue (Complex: ${isComplex}). Queue length: ${aiQueue.length}`);
                 }
                 
-                // Start queue processing if idle
                 processQueue();
             } else if (isMedia) {
                 log(`Received media from WA ${from}. Downloading...`);
-                
-                // --- Store Media Event in Memory ---
-                if (isGroup) {
-                    let waConfig = {};
-                    try { waConfig = JSON.parse(fs.readFileSync("./package/wa_config.json", "utf-8")); } catch(e) {}
-                    let allowedGroups = waConfig.allowedGroups || [];
-                    if (allowedGroups.includes(from)) {
-                        const type = Object.keys(msg.message)[0];
-                        const senderName = msg.pushName || (participant ? participant.split('@')[0] : from.split('@')[0]);
-                        const memPath = path.join("./package/storage", `memory_${from.split('@')[0]}.json`);
-                        let memArr = [];
-                        try { if (fs.existsSync(memPath)) memArr = JSON.parse(fs.readFileSync(memPath, "utf-8")); } catch(e){}
-                        memArr.push(`[${new Date().toLocaleTimeString('id-ID')}] ${senderName} sent media (${type})`);
-                        if (memArr.length > 50) memArr.shift(); 
-                        fs.writeFileSync(memPath, JSON.stringify(memArr, null, 2));
-                    }
-                }
                 
                 const buffer = await downloadMediaMessage(
                     msg,
@@ -784,7 +708,6 @@ export async function connectToWhatsApp(bot, devId) {
                     filename = msg.message.documentMessage.fileName;
                 }
                 
-                // Save locally in caches/files/
                 const fileIdNum = saveLocalFile(from, buffer, filename);
                 log(`Saved persistent file from WA: ${filename} with ID ${fileIdNum}`);
                 

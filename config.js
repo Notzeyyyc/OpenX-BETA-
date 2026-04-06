@@ -1,8 +1,5 @@
 export const config = {
-    telegram: {
-        token: "8699947653:AAFbA4Uk1ypXH1eYbniSDn-gAPiap-JH-aE",
-        devId: "8496926391",
-    },
+    devPhoneNumber: "628496926391", // Change this to your WhatsApp number
     openrouter: {
         apiKeys: [
             "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",
