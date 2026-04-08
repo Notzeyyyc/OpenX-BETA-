@@ -20,7 +20,7 @@ const MODEL          = 'google/gemini-2.0-flash-001';
 
 let notifyFn = null;
 
-/** Pending update waiting for user confirmation: { moduleName, newCode } */
+/** Pending update waiting for user confirmation */
 let pendingUpdate = null;
 
 // ─── Safety helpers ───────────────────────────────────────────────────────────
@@ -172,10 +172,18 @@ export async function requestUpdate(moduleName, instruction) {
         }
 
         // Store pending update (not yet committed to disk)
-        pendingUpdate = { moduleName, filePath, newCode: cleanCode };
+        pendingUpdate = {
+            moduleName,
+            filePath,
+            originalCode,
+            newCode: cleanCode,
+            instruction: String(instruction || '').trim(),
+            createdAt: Date.now()
+        };
 
         if (notifyFn) notifyFn(
             `✅ *SelfUpdate*: Update *${moduleName}.mjs* siap!\n\n` +
+            `Ketik *"preview update"* buat lihat ringkasan dulu.\n` +
             `Balas dengan ketik *"apply update"* untuk terapkan,\n` +
             `atau *"cancel update"* untuk batalkan.`
         );
@@ -199,7 +207,7 @@ export async function applyUpdate() {
     const { moduleName, filePath, newCode } = pendingUpdate;
     pendingUpdate = null;
 
-    const backupPath = filePath.replace('.mjs', '.backup.mjs');
+    const backupPath = filePath.replace('.mjs', `.backup.${Date.now()}.mjs`);
 
     try {
         // Backup original
@@ -262,6 +270,23 @@ export function cancelUpdate() {
 /** Returns true if there is a pending update waiting for confirmation. */
 export function hasPendingUpdate() {
     return pendingUpdate !== null;
+}
+
+/**
+ * Return short, human-readable summary for pending update.
+ */
+export function getPendingSummary() {
+    if (!pendingUpdate) return null;
+    const oldLines = pendingUpdate.originalCode.split('\n');
+    const newLines = pendingUpdate.newCode.split('\n');
+    return {
+        moduleName: pendingUpdate.moduleName,
+        instruction: pendingUpdate.instruction,
+        oldLineCount: oldLines.length,
+        newLineCount: newLines.length,
+        delta: newLines.length - oldLines.length,
+        ageSec: Math.floor((Date.now() - pendingUpdate.createdAt) / 1000)
+    };
 }
 
 /**

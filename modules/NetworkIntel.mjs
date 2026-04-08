@@ -1,235 +1,227 @@
 /**
  * NetworkIntel.mjs
- * Monitors per-app data usage via /proc/net/xt_qtaguid/stats (root).
- * Fallback: dumpsys netstats (ColorOS-aware parsing).
- * Detects data spikes > 50 MB in 5 minutes and notifies via WA.
- * Watches /proc/net/route for network reconnect events (every 30 s).
+ * Source of truth (device-confirmed):
+ * - Interface monitoring: /proc/net/dev (ccmni1 mobile, wlan0 wifi)
+ * - Per-app monitoring: dumpsys netstats with "uid=...,package=..."
+ * - No xt_qtaguid / no eBPF dependency.
  */
 
 import fs from 'fs';
 import { execSync } from 'child_process';
 
-const SPIKE_THRESHOLD_BYTES = 50 * 1024 * 1024; // 50 MB
-const MONITOR_INTERVAL_MS   = 5 * 60 * 1000;    // 5 minutes for spike check
-const ROUTE_CHECK_INTERVAL  = 30 * 1000;         // 30 seconds for reconnect
+const WATCH_INTERFACES = ['ccmni1', 'wlan0'];
+const HOTSPOT_INTERFACES = ['ap0', 'swlan0', 'rndis0'];
+const DEFAULT_INTERVAL_SEC = 30;
+const DEFAULT_SPIKE_MB = 15;
 
-let notifyFn       = null;
-let monitorTimer   = null;
-let routeTimer     = null;
-let reconnectCbs   = [];
+let notifyFn = null;
+let monitorTimer = null;
+let reconnectCbs = [];
+let prevIface = null; // { iface: {rx,tx,total} }
+let prevHotspot = null;
+const config = {
+    intervalSec: DEFAULT_INTERVAL_SEC,
+    spikeMb: DEFAULT_SPIKE_MB,
+    hotspotMonitor: true
+};
 
-/** Snapshot of prev usage: { uid -> totalBytes } */
-let prevUsage = {};
-/** Whether we currently have a default route (network up) */
-let prevHasRoute = false;
-
-// ─── UID → App name map ───────────────────────────────────────────────────────
-
-/**
- * Build uid→packageName map using `pm list packages -U` (root).
- * Falls back to UID string if parsing fails.
- */
-function buildUidMap() {
-    const map = {};
+function readInterfaceTotals() {
+    const out = {};
     try {
-        const raw = execSync('su -c "pm list packages -U"', { encoding: 'utf-8', timeout: 8000 });
-        // Each line: "package:com.example uid:10123"
-        for (const line of raw.split('\n')) {
-            const pkgMatch  = line.match(/package:(\S+)/);
-            const uidMatch  = line.match(/uid:(\d+)/);
-            if (pkgMatch && uidMatch) {
-                map[uidMatch[1]] = pkgMatch[1];
-            }
+        const raw = fs.readFileSync('/proc/net/dev', 'utf-8');
+        for (const line of raw.split('\n').slice(2)) {
+            if (!line.includes(':')) continue;
+            const [ifaceRaw, rest] = line.split(':');
+            const iface = ifaceRaw.trim();
+            if (!WATCH_INTERFACES.includes(iface)) continue;
+            const parts = rest.trim().split(/\s+/);
+            const rx = parseInt(parts[0] || '0', 10);
+            const tx = parseInt(parts[8] || '0', 10);
+            out[iface] = { rx, tx, total: rx + tx };
         }
-    } catch { /* ignore — map stays empty */ }
-    return map;
+    } catch {}
+    return out;
 }
 
-// ─── Data usage readers ───────────────────────────────────────────────────────
-
-/**
- * Read per-UID bytes from /proc/net/xt_qtaguid/stats (requires root).
- * Returns { uid -> totalBytes }
- */
-function readQtaguid() {
+function parseNetstatsPerApp() {
     const usage = {};
     try {
-        const raw = execSync(
-            'su -c "cat /proc/net/xt_qtaguid/stats"',
-            { encoding: 'utf-8', timeout: 5000 }
-        );
-        // Columns: idx iface acct_tag_hex uid_tag_int cnt_set rx_bytes rx_pkts tx_bytes tx_pkts ...
-        for (const line of raw.split('\n').slice(1)) {
-            const parts = line.trim().split(/\s+/);
-            if (parts.length < 9) continue;
-            const uid      = parts[3];
-            const rxBytes  = parseInt(parts[5]) || 0;
-            const txBytes  = parseInt(parts[7]) || 0;
-            usage[uid] = (usage[uid] || 0) + rxBytes + txBytes;
-        }
-    } catch {
-        return null; // signal fallback needed
-    }
-    return usage;
-}
+        const raw = execSync('su -c "dumpsys netstats"', { encoding: 'utf-8', timeout: 12000 });
 
-/**
- * Fallback: parse `dumpsys netstats` for total bytes per UID.
- * ColorOS may use slightly different line formats — we handle both.
- * Returns { uid -> totalBytes }
- */
-function readNetstatsFallback() {
-    const usage = {};
-    try {
-        const raw = execSync(
-            'su -c "dumpsys netstats"',
-            { encoding: 'utf-8', timeout: 10000 }
-        );
-        // Match lines like: "UID=10123 ..." or "uid=10123"
-        // and byte lines: "  rxBytes=... txBytes=..."
+        // Packetized parser: blocks start with uid=..,package=..
+        // Then collect rxBytes/txBytes lines until next uid/package block.
         let currentUid = null;
-        for (const line of raw.split('\n')) {
-            const uidMatch = line.match(/uid[Ee]?=(\d+)/);
-            if (uidMatch) { currentUid = uidMatch[1]; continue; }
+        let currentPkg = null;
 
-            if (currentUid) {
-                const rxMatch = line.match(/rxBytes[=:](\d+)/);
-                const txMatch = line.match(/txBytes[=:](\d+)/);
-                if (rxMatch || txMatch) {
-                    const rx = parseInt(rxMatch?.[1]) || 0;
-                    const tx = parseInt(txMatch?.[1]) || 0;
-                    usage[currentUid] = (usage[currentUid] || 0) + rx + tx;
-                }
+        for (const line of raw.split('\n')) {
+            const header = line.match(/uid=(\d+)\s*,\s*package=([a-zA-Z0-9._$-]+)/);
+            if (header) {
+                currentUid = header[1];
+                currentPkg = header[2];
+                const key = `${currentUid}|${currentPkg}`;
+                if (!usage[key]) usage[key] = { uid: currentUid, name: currentPkg, bytes: 0 };
+                continue;
+            }
+
+            if (!currentUid || !currentPkg) continue;
+            const rx = line.match(/rxBytes[=:](\d+)/);
+            const tx = line.match(/txBytes[=:](\d+)/);
+            if (rx || tx) {
+                const key = `${currentUid}|${currentPkg}`;
+                usage[key].bytes += (parseInt(rx?.[1] || '0', 10) + parseInt(tx?.[1] || '0', 10));
             }
         }
-    } catch { /* return empty */ }
+    } catch {}
     return usage;
 }
 
-/**
- * Get current data usage, trying qtaguid first then netstats.
- */
-function getCurrentUsage() {
-    const qtaguid = readQtaguid();
-    return qtaguid ?? readNetstatsFallback();
-}
+function detectInterfaceSpikes(curr) {
+    if (!notifyFn || !prevIface) return;
 
-// ─── Spike detector ───────────────────────────────────────────────────────────
-
-/**
- * Compare current usage snapshot to previous. Alert if any UID increased
- * by more than SPIKE_THRESHOLD_BYTES since last check.
- */
-function checkForSpikes(current, uidMap) {
-    if (!notifyFn) return;
-    for (const [uid, bytes] of Object.entries(current)) {
-        const prev    = prevUsage[uid] || 0;
-        const delta   = bytes - prev;
-        if (delta > SPIKE_THRESHOLD_BYTES) {
-            const name = uidMap[uid] || `UID:${uid}`;
-            const mb   = (delta / 1024 / 1024).toFixed(1);
+    for (const iface of WATCH_INTERFACES) {
+        const c = curr[iface];
+        const p = prevIface[iface];
+        if (!c || !p) continue;
+        const delta = c.total - p.total;
+        if (delta > config.spikeMb * 1024 * 1024) {
+            const mb = (delta / 1024 / 1024).toFixed(2);
+            const label = iface === 'ccmni1' ? 'Mobile Data (ccmni1)' : 'WiFi (wlan0)';
             notifyFn(
-                `📶 *NetworkIntel Alert*\n\n` +
-                `App *${name}* pakai data *${mb} MB* dalam 5 menit terakhir di background!\n` +
-                `Mau gue matiin datanya?`
+                `📶 *NetworkIntel Spike*\n\n` +
+                `${label} naik *${mb} MB* dalam ${config.intervalSec} detik.\n` +
+                `Cek app yang lagi boros data.`
             );
         }
     }
 }
 
-// ─── Route watcher (reconnect) ────────────────────────────────────────────────
-
-/**
- * Check /proc/net/route for any non-loopback default gateway.
- * Emits reconnect events when network comes back after being down.
- */
-function checkRoute() {
-    let hasRoute = false;
+function readHotspotTotals() {
+    const out = {};
     try {
-        const raw = fs.readFileSync('/proc/net/route', 'utf-8');
-        for (const line of raw.split('\n').slice(1)) {
-            const parts = line.trim().split(/\s+/);
-            // Destination = 00000000 means default route
-            if (parts[1] === '00000000' && parts[0] !== 'lo') {
-                hasRoute = true;
-                break;
-            }
+        const raw = fs.readFileSync('/proc/net/dev', 'utf-8');
+        for (const line of raw.split('\n').slice(2)) {
+            if (!line.includes(':')) continue;
+            const [ifaceRaw, rest] = line.split(':');
+            const iface = ifaceRaw.trim();
+            if (!HOTSPOT_INTERFACES.includes(iface)) continue;
+            const parts = rest.trim().split(/\s+/);
+            const rx = parseInt(parts[0] || '0', 10);
+            const tx = parseInt(parts[8] || '0', 10);
+            out[iface] = { rx, tx, total: rx + tx };
         }
-    } catch { /* /proc unavailable (dev/test) */ }
-
-    if (hasRoute && !prevHasRoute) {
-        // Network just came back up
-        for (const cb of reconnectCbs) {
-            try { cb(); } catch { /* ignore */ }
-        }
-        if (notifyFn) notifyFn('🌐 *NetworkIntel*: Koneksi internet tersambung kembali!');
-    }
-    prevHasRoute = hasRoute;
+    } catch {}
+    return out;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+function detectHotspotSpike(curr) {
+    if (!config.hotspotMonitor || !notifyFn || !prevHotspot) return;
+    for (const iface of HOTSPOT_INTERFACES) {
+        const c = curr[iface];
+        const p = prevHotspot[iface];
+        if (!c || !p) continue;
+        const delta = c.total - p.total;
+        if (delta > config.spikeMb * 1024 * 1024) {
+            const mb = (delta / 1024 / 1024).toFixed(2);
+            notifyFn(
+                `🔥 *Hotspot Spike*\n\n` +
+                `Interface ${iface} naik *${mb} MB* dalam ${config.intervalSec} detik.\n` +
+                `Kemungkinan ada klien hotspot yang boros data.`
+            );
+        }
+    }
+}
 
-/**
- * Start all network monitoring (spike + reconnect).
- */
+function isHotspotLikelyOn(curr) {
+    return Object.keys(curr).length > 0;
+}
+
+function detectReconnect(curr) {
+    const hadAny = prevIface && Object.keys(prevIface).length > 0;
+    const hasAny = Object.keys(curr).length > 0;
+    if (hadAny === false && hasAny === true) {
+        for (const cb of reconnectCbs) {
+            try { cb(); } catch {}
+        }
+        if (notifyFn) notifyFn('🌐 *NetworkIntel*: Interface network aktif kembali.');
+    }
+}
+
 export function startMonitoring() {
-    if (monitorTimer) return; // already running
-
-    // Build UID map once (refresh occasionally inside closure)
-    let uidMap = buildUidMap();
+    if (monitorTimer) return;
+    prevIface = readInterfaceTotals();
+    prevHotspot = readHotspotTotals();
 
     monitorTimer = setInterval(() => {
-        const current = getCurrentUsage();
-        uidMap = buildUidMap(); // refresh app list
-        checkForSpikes(current, uidMap);
-        prevUsage = current;
-    }, MONITOR_INTERVAL_MS);
-
-    // Initialise prevUsage baseline immediately
-    prevUsage = getCurrentUsage();
-
-    // Start route watcher
-    prevHasRoute = false;
-    routeTimer = setInterval(checkRoute, ROUTE_CHECK_INTERVAL);
+        const curr = readInterfaceTotals();
+        const hotspotCurr = readHotspotTotals();
+        detectReconnect(curr);
+        detectInterfaceSpikes(curr);
+        detectHotspotSpike(hotspotCurr);
+        prevIface = curr;
+        prevHotspot = hotspotCurr;
+    }, config.intervalSec * 1000);
 }
 
-/**
- * Stop all network monitoring timers.
- */
 export function stopMonitoring() {
-    if (monitorTimer) { clearInterval(monitorTimer); monitorTimer = null; }
-    if (routeTimer)   { clearInterval(routeTimer);   routeTimer   = null; }
+    if (monitorTimer) {
+        clearInterval(monitorTimer);
+        monitorTimer = null;
+    }
 }
 
 /**
- * Return current per-app data usage snapshot (human-readable).
+ * Return current per-app usage snapshot from dumpsys netstats.
  * @returns {Array<{uid, name, mb}>}
  */
 export function getDataUsage() {
-    const uidMap  = buildUidMap();
-    const current = getCurrentUsage();
-    return Object.entries(current)
-        .map(([uid, bytes]) => ({
-            uid,
-            name: uidMap[uid] || `UID:${uid}`,
-            mb: parseFloat((bytes / 1024 / 1024).toFixed(2))
+    const map = parseNetstatsPerApp();
+    return Object.values(map)
+        .map(row => ({
+            uid: row.uid,
+            name: row.name,
+            mb: parseFloat((row.bytes / 1024 / 1024).toFixed(2))
         }))
         .sort((a, b) => b.mb - a.mb)
-        .slice(0, 20); // top 20 apps
+        .slice(0, 20);
 }
 
-/**
- * Register a callback to fire when the device reconnects to the internet.
- * @param {Function} cb
- */
 export function onReconnect(cb) {
     reconnectCbs.push(cb);
 }
 
-/**
- * Set the WA notification function.
- * @param {Function} fn - (text: string) => void
- */
 export function setNotifyFn(fn) {
     notifyFn = fn;
+}
+
+export function getConfig() {
+    return { ...config };
+}
+
+export function updateConfig(partial = {}) {
+    if (typeof partial.intervalSec === 'number' && Number.isFinite(partial.intervalSec)) {
+        config.intervalSec = Math.min(Math.max(Math.round(partial.intervalSec), 10), 300);
+    }
+    if (typeof partial.spikeMb === 'number' && Number.isFinite(partial.spikeMb)) {
+        config.spikeMb = Math.min(Math.max(partial.spikeMb, 1), 500);
+    }
+    if (typeof partial.hotspotMonitor === 'boolean') {
+        config.hotspotMonitor = partial.hotspotMonitor;
+    }
+
+    // Apply live by restarting monitor loop safely
+    const wasRunning = !!monitorTimer;
+    if (wasRunning) {
+        stopMonitoring();
+        startMonitoring();
+    }
+    return getConfig();
+}
+
+export function getHotspotStatus() {
+    const curr = readHotspotTotals();
+    return {
+        monitorEnabled: config.hotspotMonitor,
+        active: isHotspotLikelyOn(curr),
+        interfaces: curr
+    };
 }

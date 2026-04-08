@@ -1,9 +1,11 @@
 {
-    "defaultModel": "z-ai/glm-4.5-air:free",
+    "defaultModel": "openai/gpt-oss-120b:free",
     "availableModels": [
-        "liquid/lfm-2.5-1.2b-thinking:free",
+        "openai/gpt-oss-120b:free",
         "z-ai/glm-4.5-air:free",
         "minimax/minimax-m2.5:free",
-        "openai/gpt-oss-120b:free"
+        "qwen/qwen3-32b:free",
+        "deepseek/deepseek-r1-0528:free",
+        "liquid/lfm-2.5-1.2b-thinking:free"
     ]
 }

@@ -2,6 +2,15 @@ import { config } from "../../config.js";
 import fs from "fs";
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
+const REQUEST_TIMEOUT_MS = 55000;
+const MAX_RETRY_PER_MODEL = 2;
+const FREE_POWERFUL_PRIORITY = [
+    "openai/gpt-oss-120b:free",
+    "z-ai/glm-4.5-air:free",
+    "minimax/minimax-m2.5:free",
+    "qwen/qwen3-32b:free",
+    "deepseek/deepseek-r1-0528:free"
+];
 
 let currentKeyIndex = 0;
 
@@ -27,19 +36,28 @@ function rotateKey() {
 async function fetchModel(messages, modelName, apiKey = getActiveKey()) {
     if (!apiKey) throw new Error("No API Key configured for OpenRouter");
 
-    const response = await fetch(OPENROUTER_API_URL, {
-        method: "POST",
-        headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/openxx",
-            "X-Title": "OPENX Bot"
-        },
-        body: JSON.stringify({
-            model: modelName,
-            messages: messages
-        })
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let response;
+    try {
+        response = await fetch(OPENROUTER_API_URL, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/openxx",
+                "X-Title": "OPENX Bot"
+            },
+            body: JSON.stringify({
+                model: modelName,
+                temperature: 0.7,
+                messages: messages
+            }),
+            signal: controller.signal
+        });
+    } finally {
+        clearTimeout(timeoutId);
+    }
 
     if (!response.ok) {
         const err = new Error(`API error (${modelName}): ${response.status} ${response.statusText}`);
@@ -66,12 +84,19 @@ export async function chatCompletion(messages, model = null, isComplex = false) 
 
     const lastMessage = messages[messages.length - 1].content || "";
     
+    const preferred = model || modelData.defaultModel;
+    const pool = uniqueModels([
+        preferred,
+        ...FREE_POWERFUL_PRIORITY,
+        ...(modelData.availableModels || [])
+    ]);
+
     // MODEL COMMITTEE FEATURE (Only for Complex Mode)
     if (isComplex && modelData.availableModels && modelData.availableModels.length > 1) {
         console.log("[AI Routing] Complex request detected. Synthesizing models...");
         
         // Fetch max 3 models SEQUENTIALLY to avoid hitting concurrent rate limits
-        const committeeModels = modelData.availableModels.slice(0, 3);
+        const committeeModels = pool.slice(0, 3);
         const validResults = [];
         
         for (const m of committeeModels) {
@@ -91,17 +116,12 @@ export async function chatCompletion(messages, model = null, isComplex = false) 
              ];
              
              // Try to find a model to synthesize the final answer
-             return await callWithRotation(synthMessages, modelData.defaultModel);
+             return await callWithRotation(synthMessages, preferred);
         }
     }
 
     // AUTO-SWITCH FEATURE (Regular Fallback)
-    let targetModels = [model || modelData.defaultModel];
-    if (modelData.availableModels && modelData.availableModels.length > 0) {
-        targetModels = [...new Set([targetModels[0], ...modelData.availableModels])];
-    }
-    
-    for (const currentModel of targetModels) {
+    for (const currentModel of pool) {
         try {
             console.log(`[AI Routing] Calling model: ${currentModel}`);
             const result = await callWithRotation(messages, currentModel);
@@ -119,20 +139,37 @@ export async function chatCompletion(messages, model = null, isComplex = false) 
  */
 async function callWithRotation(messages, modelName) {
     const keys = config.openrouter.apiKeys || [];
+    if (keys.length === 0) throw new Error("No OpenRouter keys configured");
     let attempts = 0;
     
     while (attempts < keys.length) {
-        try {
-            return await fetchModel(messages, modelName);
-        } catch (err) {
-            // If rate limited (429), rotate to the next key and try again
-            if (err.status === 429 && keys.length > 1 && attempts < keys.length - 1) {
-                console.warn(`[AI Routing] API Key #${currentKeyIndex} rate limited. Rotating...`);
-                rotateKey();
-                attempts++;
-                continue;
+        for (let i = 0; i < MAX_RETRY_PER_MODEL; i++) {
+            try {
+                return await fetchModel(messages, modelName);
+            } catch (err) {
+                const isRetriable = err.status === 429 || err.status >= 500 || err.name === "AbortError";
+                if (isRetriable && i < MAX_RETRY_PER_MODEL - 1) {
+                    await delay(700 * (i + 1));
+                    continue;
+                }
+                // If rate limited/server-side, rotate to the next key and try again
+                if (isRetriable && keys.length > 1 && attempts < keys.length - 1) {
+                    console.warn(`[AI Routing] API Key #${currentKeyIndex} failed (${err.status || err.name}). Rotating...`);
+                    rotateKey();
+                    attempts++;
+                    break;
+                }
+                throw err;
             }
-            throw err;
         }
     }
+    throw new Error(`All API keys failed for model ${modelName}`);
+}
+
+function uniqueModels(list) {
+    return [...new Set((list || []).filter(Boolean).map(String))];
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }

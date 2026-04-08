@@ -8,7 +8,21 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 const execPromise = promisify(exec);
 import { chatCompletion } from './package/openx/openrouter.js';
-import { getDeviceInfo, getAppList, takeScreenshot, sendNotification, getHealthStatus } from './package/adb_helper.js';
+import {
+    getDeviceInfo,
+    getAppList,
+    takeScreenshot,
+    sendNotification,
+    getHealthStatus,
+    launchApp,
+    tapByText,
+    tapByResourceId,
+    scrollScreen,
+    pressBack,
+    pressHome,
+    dumpUiHierarchy,
+    runUiFlow
+} from './package/adb_helper.js';
 import { downloadMedia } from './package/downloader.js';
 import { config } from './config.js';
 import { initModules, handleMessage as moduleHandleMessage } from './modules/index.mjs';
@@ -23,6 +37,49 @@ function getCurrentModel() {
     } catch {
         return targetModel;
     }
+}
+
+const STORAGE_CONTEXT_TTL_MS = 15000;
+const STORAGE_MAX_FILES = 20;
+const STORAGE_MAX_CHARS_PER_FILE = 1200;
+const storageContextCache = { ts: 0, text: "" };
+
+function buildStorageContext() {
+    const now = Date.now();
+    if (now - storageContextCache.ts < STORAGE_CONTEXT_TTL_MS) {
+        return storageContextCache.text;
+    }
+
+    let storageContext = "";
+    try {
+        const storageDir = "./package/storage";
+        if (fs.existsSync(storageDir)) {
+            const files = fs.readdirSync(storageDir)
+                .map(name => {
+                    const full = path.join(storageDir, name);
+                    let mtime = 0;
+                    try { mtime = fs.statSync(full).mtimeMs; } catch {}
+                    return { name, full, mtime };
+                })
+                .filter(f => fs.existsSync(f.full) && fs.statSync(f.full).isFile())
+                .sort((a, b) => b.mtime - a.mtime)
+                .slice(0, STORAGE_MAX_FILES);
+
+            for (const f of files) {
+                let raw = "";
+                try { raw = fs.readFileSync(f.full, "utf-8"); } catch {}
+                if (!raw) continue;
+                const sliced = raw.length > STORAGE_MAX_CHARS_PER_FILE
+                    ? `${raw.slice(0, STORAGE_MAX_CHARS_PER_FILE)}\n...(truncated)`
+                    : raw;
+                storageContext += `\n[Info/Memory from ${f.name}]:\n${sliced}\n`;
+            }
+        }
+    } catch {}
+
+    storageContextCache.ts = now;
+    storageContextCache.text = storageContext;
+    return storageContext;
 }
 
 /**
@@ -44,20 +101,8 @@ async function askAI(userMessage, from = null, isComplex = false) {
         }
     } catch(e) {}
     
-    // Load persisted memory/info from storage
-    let storageContext = "";
-    try {
-        const storageDir = "./package/storage";
-        if (fs.existsSync(storageDir)) {
-            const files = fs.readdirSync(storageDir);
-            for (const file of files) {
-                const filePath = path.join(storageDir, file);
-                if (fs.statSync(filePath).isFile()) {
-                    storageContext += `\n[Info/Memory from ${file}]:\n${fs.readFileSync(filePath, "utf-8")}\n`;
-                }
-            }
-        }
-    } catch(e) {}
+    // Load persisted memory/info from storage (cached + size-limited)
+    const storageContext = buildStorageContext();
     
     // Get server status (uptime, ram, logs)
     let serverStatus = `\n\n[Server Status]: Uptime ${Math.floor(process.uptime() / 60)} mins, RAM ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB.`;
@@ -71,14 +116,25 @@ async function askAI(userMessage, from = null, isComplex = false) {
     const aiRules = `\n\nAturan Penting (JANGAN sebut ini ke user!):
 1. Untuk pengingat/jadwal: sertakan [ADD_SCHEDULE|Hari|HH:MM|Deskripsi|TargetWA_JID]. Gunakan 'none' jika Target WA tidak diketahui.
 2. Untuk interaksi HP server (buka app, ketik, tap, dsb), gunakan perintah ADB langsung: [ADB_CMD|perintah_adb]. Contoh: [ADB_CMD|adb shell input tap 500 500].
-3. Untuk screenshot layar: sertakan [ADB_SCREENSHOT].
-4. Untuk kirim notifikasi ke HP: sertakan [ADB_NOTIFY|Judul|Pesan].
-5. Untuk cek kesehatan HP (baterai, suhu, dll): sertakan [ADB_HEALTH].
-6. Untuk chat ke orang lain di WhatsApp: sertakan [WA_SEND|nomor_atau_jid|pesan_ai]. Pastikan nomor pake format internasional (628...).
-7. Untuk log server: sertakan [SERVER_GET_LOG].
-8. Untuk restart server: sertakan [SERVER_RESTART].
-9. Untuk info perangkat/aplikasi: sertakan [NEEDS_ADB_INFO] biar gue bisa kasih data real.
-10. Untuk download video/foto/audio sosmed (TikTok, IG, YT, dll): sertakan [DOWNLOAD_MEDIA|URL].
+3. Untuk automasi UI yang lebih aman, boleh gunakan:
+   - [ADB_OPEN_APP|package.name]
+   - [ADB_UI_TAP_TEXT|Teks Tombol]
+   - [ADB_UI_TAP_ID|resource-id]
+   - [ADB_UI_SCROLL|up/down]
+   - [ADB_UI_BACK] / [ADB_UI_HOME]
+   - [ADB_UI_DUMP]
+   - [ADB_UI_FLOW|open:com.whatsapp;tap_text:Chats;verify_text:Chats;scroll:down]
+   - [ADB_BG_FLOW|flow yang sama tapi jalan di background]
+   - verify step yang didukung flow: verify_text:<teks> atau verify_id:<resource-id>
+4. Sebelum menjalankan aksi penting, kasih heads-up dulu via [PRE_NOTIFY|pesan singkat].
+5. Untuk screenshot layar: sertakan [ADB_SCREENSHOT].
+6. Untuk kirim notifikasi ke HP: sertakan [ADB_NOTIFY|Judul|Pesan].
+7. Untuk cek kesehatan HP (baterai, suhu, dll): sertakan [ADB_HEALTH].
+8. Untuk chat ke orang lain di WhatsApp: sertakan [WA_SEND|nomor_atau_jid|pesan_ai]. Pastikan nomor pake format internasional (628...).
+9. Untuk log server: sertakan [SERVER_GET_LOG].
+10. Untuk restart server: sertakan [SERVER_RESTART].
+11. Untuk info perangkat/aplikasi: sertakan [NEEDS_ADB_INFO] biar gue bisa kasih data real.
+12. Untuk download video/foto/audio sosmed (TikTok, IG, YT, dll): sertakan [DOWNLOAD_MEDIA|URL].
 
 PENTING: Balas dengan gaya bahasa sesuai kepribadian lu yang sudah ditentukan di atas. Taro tag perintah di paling akhir balasan secara tersembunyi.`;
 
@@ -113,36 +169,28 @@ PENTING: Balas dengan gaya bahasa sesuai kepribadian lu yang sudah ditentukan di
         aiResult = aiResult.replace(/\[NEEDS_ADB_INFO\]/g, "");
     }
 
-    // ADB Command Loop (Max 3 retries)
-    let loopCount = 0;
+    // ADB command gate (sensitive action)
     const adbCmdRegex = /\[ADB_CMD\|(.*?)\]/g;
-    while (adbCmdRegex.test(aiResult) && loopCount < 3) {
-        loopCount++;
-        let match;
-        const commands = [];
-        adbCmdRegex.lastIndex = 0;
-        while ((match = adbCmdRegex.exec(aiResult)) !== null) {
-            commands.push(match[1].trim());
-        }
-
-        let totalOutput = "";
-        for (const cmd of commands) {
-            try {
-                const { stdout, stderr } = await execPromise(cmd);
-                totalOutput += `[Command: ${cmd}]\nOutput:\n${stdout || "No Output"}\n${stderr ? "Error:\n" + stderr : ""}\n---\n`;
-            } catch (err) {
-                totalOutput += `[Command: ${cmd}]\nFailed: ${err.message}\n---\n`;
-            }
-        }
-
-        if (totalOutput) {
-            messages.push({ role: "assistant", content: aiResult });
-            messages.push({ role: "user", content: `(System) ADB Results:\n${totalOutput}\nRespond naturally or continue commands if needed.` });
-            aiResult = await chatCompletion(messages, getCurrentModel(), isComplex);
-            if (!aiResult) aiResult = "";
-        }
+    let adbMatch;
+    const commands = [];
+    while ((adbMatch = adbCmdRegex.exec(aiResult)) !== null) {
+        commands.push(adbMatch[1].trim());
+    }
+    if (commands.length > 0 && from) {
+        const token = queueSensitiveAction(from, 'adb_cmd', { commands }, `ADB command x${commands.length}`);
+        await sendSensitiveConfirmationPrompt(from, `Aksi sensitif terdeteksi: ADB command (${commands.length})`, token);
     }
     aiResult = aiResult.replace(adbCmdRegex, '');
+
+    // Optional pre-notify message to user before actions
+    const preNotifyRegex = /\[PRE_NOTIFY\|(.*?)\]/g;
+    let pnMatch;
+    while ((pnMatch = preNotifyRegex.exec(aiResult)) !== null) {
+        if (from && waSock) {
+            await waSock.sendMessage(from, { text: pnMatch[1].trim() }).catch(() => {});
+        }
+    }
+    aiResult = aiResult.replace(preNotifyRegex, '');
     
     // Schedule Setup Parser
     const regex = /\[ADD_SCHEDULE\|(.*?)\|(.*?)\|(.*?)\|(.*?)\]/g;
@@ -215,9 +263,8 @@ PENTING: Balas dengan gaya bahasa sesuai kepribadian lu yang sudah ditentukan di
     const restartRegex = /\[SERVER_RESTART\]/g;
     if (restartRegex.test(aiResult)) {
         if (from && waSock) {
-            setTimeout(() => {
-                process.exit(1);
-            }, 2000);
+            const token = queueSensitiveAction(from, 'server_restart', {}, 'Server restart');
+            await sendSensitiveConfirmationPrompt(from, 'Aksi sensitif: restart server', token);
         }
         aiResult = aiResult.replace(restartRegex, '');
     }
@@ -229,6 +276,80 @@ PENTING: Balas dengan gaya bahasa sesuai kepribadian lu yang sudah ditentukan di
         sendNotification(notifyMatch[1], notifyMatch[2]).catch(() => {});
     }
     aiResult = aiResult.replace(adbNotifyRegex, '');
+
+    // UIAutomator / navigation helpers
+    const openAppRegex = /\[ADB_OPEN_APP\|(.*?)\]/g;
+    let openMatch;
+    while ((openMatch = openAppRegex.exec(aiResult)) !== null) {
+        await launchApp(openMatch[1].trim());
+    }
+    aiResult = aiResult.replace(openAppRegex, '');
+
+    const tapTextRegex = /\[ADB_UI_TAP_TEXT\|(.*?)\]/g;
+    let tapTextMatch;
+    while ((tapTextMatch = tapTextRegex.exec(aiResult)) !== null) {
+        await tapByText(tapTextMatch[1].trim());
+    }
+    aiResult = aiResult.replace(tapTextRegex, '');
+
+    const tapIdRegex = /\[ADB_UI_TAP_ID\|(.*?)\]/g;
+    let tapIdMatch;
+    while ((tapIdMatch = tapIdRegex.exec(aiResult)) !== null) {
+        await tapByResourceId(tapIdMatch[1].trim());
+    }
+    aiResult = aiResult.replace(tapIdRegex, '');
+
+    const scrollRegex = /\[ADB_UI_SCROLL\|(.*?)\]/g;
+    let scrollMatch;
+    while ((scrollMatch = scrollRegex.exec(aiResult)) !== null) {
+        await scrollScreen(scrollMatch[1].trim());
+    }
+    aiResult = aiResult.replace(scrollRegex, '');
+
+    if (/\[ADB_UI_BACK\]/.test(aiResult)) {
+        await pressBack();
+        aiResult = aiResult.replace(/\[ADB_UI_BACK\]/g, '');
+    }
+    if (/\[ADB_UI_HOME\]/.test(aiResult)) {
+        await pressHome();
+        aiResult = aiResult.replace(/\[ADB_UI_HOME\]/g, '');
+    }
+    if (/\[ADB_UI_DUMP\]/.test(aiResult)) {
+        const dump = await dumpUiHierarchy();
+        if (dump.ok) {
+            messages.push({ role: "assistant", content: aiResult });
+            messages.push({ role: "user", content: `(System) UI dump success. Node count: ${dump.nodeCount}. Suggest next navigation step in plain language.` });
+            aiResult = await chatCompletion(messages, getCurrentModel(), isComplex) || aiResult;
+        }
+        aiResult = aiResult.replace(/\[ADB_UI_DUMP\]/g, '');
+    }
+
+    const uiFlowRegex = /\[ADB_UI_FLOW\|(.*?)\]/g;
+    let flowMatch;
+    while ((flowMatch = uiFlowRegex.exec(aiResult)) !== null) {
+        const flow = flowMatch[1].trim();
+        const result = await runUiFlow(flow, { retries: 2, verifyWaitMs: 700 });
+        if (from && waSock) {
+            const tail = result.logs.slice(-6).join('\n');
+            const msg = result.ok
+                ? `✅ UI flow selesai.\n${tail}`
+                : `❌ UI flow gagal.\n${tail}`;
+            await waSock.sendMessage(from, { text: msg }).catch(() => {});
+        }
+    }
+    aiResult = aiResult.replace(uiFlowRegex, '');
+
+    const bgFlowRegex = /\[ADB_BG_FLOW\|(.*?)\]/g;
+    let bgFlowMatch;
+    while ((bgFlowMatch = bgFlowRegex.exec(aiResult)) !== null) {
+        const flow = bgFlowMatch[1].trim();
+        const task = enqueueBgFlow(flow, from);
+        if (from && waSock) {
+            await waSock.sendMessage(from, { text: `📥 BG task masuk queue: ${task.id}` }).catch(() => {});
+        }
+        processAdbBgQueue();
+    }
+    aiResult = aiResult.replace(bgFlowRegex, '');
 
     // ADB Health Handler
     if (aiResult.includes("[ADB_HEALTH]")) {
@@ -245,13 +366,13 @@ PENTING: Balas dengan gaya bahasa sesuai kepribadian lu yang sudah ditentukan di
     // WA Send/Chat to someone else
     const waSendRegex = /\[WA_SEND\|(.*?)\|(.*?)\]/g;
     let waMatch;
+    const waPending = [];
     while ((waMatch = waSendRegex.exec(aiResult)) !== null) {
-        if (waSock) {
-            let target = waMatch[1].trim();
-            const text = waMatch[2].trim();
-            if (!target.includes('@')) target = target + '@s.whatsapp.net';
-            waSock.sendMessage(target, { text }).catch(() => {});
-        }
+        waPending.push({ target: waMatch[1].trim(), text: waMatch[2].trim() });
+    }
+    if (waPending.length > 0 && from && waSock) {
+        const token = queueSensitiveAction(from, 'wa_send', { messages: waPending }, `WA send x${waPending.length}`);
+        await sendSensitiveConfirmationPrompt(from, `Aksi sensitif: kirim pesan ke nomor lain (${waPending.length} target)`, token);
     }
     aiResult = aiResult.replace(waSendRegex, '');
 
@@ -332,11 +453,282 @@ function getLocalFileById(chatId, fileIdNum) {
     }
 }
 
+function getLocalMeta(chatId) {
+    const dir = path.join("./caches/files", String(chatId).split('@')[0]);
+    const metaPath = path.join(dir, "meta.json");
+    try {
+        return JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+    } catch {
+        return {};
+    }
+}
+
+function setLocalMeta(chatId, meta) {
+    const dir = path.join("./caches/files", String(chatId).split('@')[0]);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const metaPath = path.join(dir, "meta.json");
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+}
+
+function listLocalFiles(chatId, limit = 15) {
+    const meta = getLocalMeta(chatId);
+    const rows = Object.entries(meta)
+        .map(([id, info]) => ({ id, ...info }))
+        .sort((a, b) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime())
+        .slice(0, limit);
+    return rows;
+}
+
+function deleteLocalFileById(chatId, fileIdNum) {
+    const meta = getLocalMeta(chatId);
+    const item = meta[fileIdNum];
+    if (!item) return { ok: false, reason: "not_found" };
+
+    try {
+        if (item.localPath && fs.existsSync(item.localPath)) {
+            fs.unlinkSync(item.localPath);
+        }
+    } catch {}
+
+    delete meta[fileIdNum];
+    setLocalMeta(chatId, meta);
+    return { ok: true, filename: item.filename || "unknown" };
+}
+
+function renameLocalFileById(chatId, fileIdNum, newName) {
+    const safeName = String(newName || '').trim().replace(/[\\/:*?"<>|]/g, '_');
+    if (!safeName) return { ok: false, reason: "invalid_name" };
+
+    const meta = getLocalMeta(chatId);
+    const item = meta[fileIdNum];
+    if (!item) return { ok: false, reason: "not_found" };
+    if (!item.localPath || !fs.existsSync(item.localPath)) return { ok: false, reason: "missing_file" };
+
+    const dir = path.dirname(item.localPath);
+    const targetPath = path.join(dir, safeName);
+    try {
+        fs.renameSync(item.localPath, targetPath);
+        meta[fileIdNum] = {
+            ...item,
+            localPath: targetPath,
+            filename: safeName,
+            date: new Date().toISOString()
+        };
+        setLocalMeta(chatId, meta);
+        return { ok: true, filename: safeName };
+    } catch {
+        return { ok: false, reason: "rename_failed" };
+    }
+}
+
 export let waSock = null;
 
 // AI Message Queue System
 const aiQueue = [];
 let isProcessingQueue = false;
+const adbBgQueue = [];
+let isProcessingAdbBgQueue = false;
+let activeBgTask = null;
+let bgTaskSeq = 1;
+const bgTaskHistory = [];
+const pendingSensitiveActions = new Map();
+const SENSITIVE_TTL_MS = 2 * 60 * 1000;
+
+function createSensitiveToken() {
+    return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+function queueSensitiveAction(chatId, actionType, payload, summary) {
+    const token = createSensitiveToken();
+    pendingSensitiveActions.set(String(chatId), {
+        token,
+        actionType,
+        payload,
+        summary,
+        createdAt: Date.now()
+    });
+    return token;
+}
+
+async function sendSensitiveConfirmationPrompt(jid, title, token) {
+    const fallbackText =
+        `⚠️ ${title}\n` +
+        `Ketik *confirm ${token}* untuk lanjut, atau *cancel confirm* untuk batalkan.`;
+
+    if (!waSock) return;
+
+    try {
+        await waSock.sendMessage(jid, {
+            text: `⚠️ ${title}\nPilih aksi di bawah (atau pakai teks fallback).`,
+            footer: `Fallback: confirm ${token}`,
+            buttons: [
+                { buttonId: `confirm:${token}`, buttonText: { displayText: '✅ Confirm' }, type: 1 },
+                { buttonId: 'cancel_confirm', buttonText: { displayText: '❌ Cancel' }, type: 1 }
+            ],
+            headerType: 1
+        });
+    } catch {
+        await waSock.sendMessage(jid, { text: fallbackText }).catch(() => {});
+        return;
+    }
+
+    await waSock.sendMessage(jid, { text: fallbackText }).catch(() => {});
+}
+
+async function executeSensitiveAction(pending, from) {
+    if (!pending) return { ok: false, text: "Aksi tidak ditemukan." };
+    try {
+        if (pending.actionType === 'adb_cmd') {
+            const commands = pending.payload?.commands || [];
+            let totalOutput = "";
+            for (const cmd of commands) {
+                try {
+                    const { stdout, stderr } = await execPromise(cmd);
+                    totalOutput += `[Command: ${cmd}]\n${stdout || "(no output)"}\n${stderr ? `ERR: ${stderr}\n` : ""}`;
+                } catch (err) {
+                    totalOutput += `[Command: ${cmd}] FAILED: ${err.message}\n`;
+                }
+            }
+            return { ok: true, text: totalOutput.trim() || "Command selesai dijalankan." };
+        }
+
+        if (pending.actionType === 'server_restart') {
+            if (from && waSock) {
+                await waSock.sendMessage(from, { text: "♻️ Restart server dalam 2 detik..." }).catch(() => {});
+            }
+            setTimeout(() => process.exit(1), 2000);
+            return { ok: true, text: "Restart dijadwalkan." };
+        }
+
+        if (pending.actionType === 'wa_send') {
+            const list = pending.payload?.messages || [];
+            let sent = 0;
+            for (const item of list) {
+                if (!waSock) break;
+                let target = String(item.target || '').trim();
+                if (!target) continue;
+                if (!target.includes('@')) target = `${target}@s.whatsapp.net`;
+                await waSock.sendMessage(target, { text: String(item.text || '') }).catch(() => {});
+                sent++;
+            }
+            return { ok: true, text: `WA send selesai. Total terkirim: ${sent}` };
+        }
+
+        return { ok: false, text: "Tipe aksi tidak dikenali." };
+    } catch (e) {
+        return { ok: false, text: `Eksekusi gagal: ${e.message}` };
+    }
+}
+
+function enqueueBgFlow(flow, from) {
+    const task = {
+        id: `BG${String(bgTaskSeq++).padStart(4, '0')}`,
+        flow,
+        from,
+        status: 'queued',
+        createdAt: Date.now(),
+        startedAt: null,
+        finishedAt: null,
+        cancelRequested: false,
+        logs: []
+    };
+    adbBgQueue.push(task);
+    return task;
+}
+
+function cancelBgTask(selector = 'last') {
+    const key = String(selector || 'last').toLowerCase();
+    if (key === 'all') {
+        for (const t of adbBgQueue) t.cancelRequested = true;
+        adbBgQueue.length = 0;
+        if (activeBgTask) activeBgTask.cancelRequested = true;
+        return { ok: true, msg: 'Semua queued task dibatalkan. Task aktif akan berhenti setelah step berjalan.' };
+    }
+
+    if (key === 'active' || key === 'running') {
+        if (!activeBgTask) return { ok: false, msg: 'Tidak ada task aktif.' };
+        activeBgTask.cancelRequested = true;
+        return { ok: true, msg: `Task aktif ${activeBgTask.id} diminta berhenti.` };
+    }
+
+    if (key === 'last') {
+        const last = adbBgQueue[adbBgQueue.length - 1];
+        if (!last) return { ok: false, msg: 'Tidak ada task queued.' };
+        last.cancelRequested = true;
+        adbBgQueue.pop();
+        return { ok: true, msg: `Task ${last.id} dibatalkan dari queue.` };
+    }
+
+    const idx = adbBgQueue.findIndex(t => t.id.toLowerCase() === key);
+    if (idx !== -1) {
+        adbBgQueue[idx].cancelRequested = true;
+        const id = adbBgQueue[idx].id;
+        adbBgQueue.splice(idx, 1);
+        return { ok: true, msg: `Task ${id} dibatalkan dari queue.` };
+    }
+    if (activeBgTask && activeBgTask.id.toLowerCase() === key) {
+        activeBgTask.cancelRequested = true;
+        return { ok: true, msg: `Task aktif ${activeBgTask.id} diminta berhenti.` };
+    }
+    return { ok: false, msg: `Task ${selector} tidak ditemukan.` };
+}
+
+function getBgStatusText() {
+    const queued = adbBgQueue.length;
+    const active = activeBgTask
+        ? `Aktif: ${activeBgTask.id} (${Math.round((Date.now() - activeBgTask.startedAt) / 1000)}s)`
+        : 'Aktif: -';
+    const next = adbBgQueue.slice(0, 5).map(t => `${t.id}`).join(', ') || '-';
+    return `📦 *Background Queue Status*\n${active}\nQueued: ${queued}\nNext: ${next}`;
+}
+
+async function processAdbBgQueue() {
+    if (isProcessingAdbBgQueue || adbBgQueue.length === 0) return;
+    isProcessingAdbBgQueue = true;
+
+    while (adbBgQueue.length > 0) {
+        const task = adbBgQueue.shift();
+        const { flow, from } = task;
+        try {
+            if (task.cancelRequested) {
+                task.status = 'cancelled';
+                task.finishedAt = Date.now();
+                bgTaskHistory.push(task);
+                continue;
+            }
+            activeBgTask = task;
+            task.status = 'running';
+            task.startedAt = Date.now();
+            if (from && waSock) {
+                await waSock.sendMessage(from, { text: `🛠️ Mulai UI flow background (${task.id})...` }).catch(() => {});
+            }
+            const result = await runUiFlow(flow, { retries: 2, verifyWaitMs: 700 });
+            task.logs = result.logs || [];
+            task.finishedAt = Date.now();
+            task.status = result.ok ? 'done' : 'failed';
+            if (from && waSock) {
+                const tail = result.logs.slice(-6).join('\n');
+                const msg = result.ok
+                    ? `✅ UI flow background ${task.id} selesai.\n${tail}`
+                    : `❌ UI flow background ${task.id} gagal.\n${tail}`;
+                await waSock.sendMessage(from, { text: msg }).catch(() => {});
+            }
+        } catch (e) {
+            task.finishedAt = Date.now();
+            task.status = 'failed';
+            task.logs = [...(task.logs || []), `ERROR ${e.message}`];
+            if (from && waSock) {
+                await waSock.sendMessage(from, { text: `❌ UI flow error: ${e.message}` }).catch(() => {});
+            }
+        } finally {
+            activeBgTask = null;
+            bgTaskHistory.push(task);
+            if (bgTaskHistory.length > 50) bgTaskHistory.shift();
+        }
+    }
+
+    isProcessingAdbBgQueue = false;
+}
 
 // Sequentially process messages in the queue to avoid rate limits
 async function processQueue() {
@@ -483,7 +875,22 @@ export async function connectToWhatsApp() {
             // 3. REGULAR CHAT LOGIC (DM / Groups)
             if (msg.key.fromMe) return;
             
-            const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+            const textMessage =
+                msg.message.conversation ||
+                msg.message.extendedTextMessage?.text ||
+                msg.message.buttonsResponseMessage?.selectedButtonId ||
+                msg.message.templateButtonReplyMessage?.selectedId ||
+                msg.message.listResponseMessage?.singleSelectReply?.selectedRowId ||
+                (() => {
+                    try {
+                        const raw = msg.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+                        if (!raw) return null;
+                        const parsed = JSON.parse(raw);
+                        return parsed?.id || parsed?.selectedId || null;
+                    } catch {
+                        return null;
+                    }
+                })();
             const isMedia = msg.message.imageMessage || msg.message.documentMessage || msg.message.videoMessage || msg.message.audioMessage;
             const isGroup = from.endsWith('@g.us');
 
@@ -522,6 +929,95 @@ export async function connectToWhatsApp() {
                         await waSock.sendMessage(from, { text: stripMarkdown(aiAnsw) || "Oops, couldn't find that File ID. Double check it!" });
                     }
                     return; 
+                }
+
+                // File Management Commands
+                if (/^(files|list files|daftar file|my files)$/i.test(textMessage.trim())) {
+                    const rows = listLocalFiles(from, 20);
+                    if (rows.length === 0) {
+                        await waSock.sendMessage(from, { text: "Belum ada file tersimpan di sesi ini." }, { quoted: msg });
+                        return;
+                    }
+                    const lines = rows.map((r, idx) => {
+                        const dt = r.date ? new Date(r.date).toLocaleString('id-ID') : "-";
+                        return `${idx + 1}. ${r.id} - ${r.filename || 'unnamed'} (${dt})`;
+                    });
+                    await waSock.sendMessage(from, { text: `📁 *Daftar File Tersimpan*\n\n${lines.join('\n')}\n\nKetik ID (5 digit) buat kirim ulang.` }, { quoted: msg });
+                    return;
+                }
+
+                const deleteMatch = textMessage.trim().match(/^(?:delete|hapus)\s+file\s+(\d{5})$/i);
+                if (deleteMatch) {
+                    const res = deleteLocalFileById(from, deleteMatch[1]);
+                    if (!res.ok) {
+                        await waSock.sendMessage(from, { text: "❌ File ID tidak ditemukan." }, { quoted: msg });
+                        return;
+                    }
+                    await waSock.sendMessage(from, { text: `🗑️ File ${deleteMatch[1]} (${res.filename}) berhasil dihapus.` }, { quoted: msg });
+                    return;
+                }
+
+                const renameMatch = textMessage.trim().match(/^(?:rename|ganti)\s+file\s+(\d{5})\s+(.+)$/i);
+                if (renameMatch) {
+                    const res = renameLocalFileById(from, renameMatch[1], renameMatch[2]);
+                    if (!res.ok) {
+                        const map = {
+                            invalid_name: "Nama file baru tidak valid.",
+                            not_found: "File ID tidak ditemukan.",
+                            missing_file: "File fisik tidak ditemukan.",
+                            rename_failed: "Gagal rename file."
+                        };
+                        await waSock.sendMessage(from, { text: `❌ ${map[res.reason] || "Gagal rename file."}` }, { quoted: msg });
+                        return;
+                    }
+                    await waSock.sendMessage(from, { text: `✏️ File ${renameMatch[1]} berhasil diubah jadi: ${res.filename}` }, { quoted: msg });
+                    return;
+                }
+
+                const normalizedText = textMessage.trim();
+                const normalizedForConfirm = normalizedText.replace(/\s+/g, ' ').trim();
+
+                // Sensitive action confirmations
+                if (/^cancel confirm$/i.test(normalizedForConfirm) || /^cancel_confirm$/i.test(normalizedForConfirm)) {
+                    pendingSensitiveActions.delete(String(from));
+                    await waSock.sendMessage(from, { text: "✅ Pending aksi sensitif dibatalkan." }, { quoted: msg });
+                    return;
+                }
+                const confirmMatch =
+                    normalizedForConfirm.match(/^confirm\s+([A-Z0-9]{4,10})$/i) ||
+                    normalizedForConfirm.match(/^confirm:([A-Z0-9]{4,10})$/i);
+                if (confirmMatch) {
+                    const pending = pendingSensitiveActions.get(String(from));
+                    if (!pending) {
+                        await waSock.sendMessage(from, { text: "⚠️ Tidak ada aksi sensitif yang menunggu konfirmasi." }, { quoted: msg });
+                        return;
+                    }
+                    if (Date.now() - pending.createdAt > SENSITIVE_TTL_MS) {
+                        pendingSensitiveActions.delete(String(from));
+                        await waSock.sendMessage(from, { text: "⏱️ Token konfirmasi sudah expired. Minta ulang aksinya." }, { quoted: msg });
+                        return;
+                    }
+                    if (pending.token.toLowerCase() !== confirmMatch[1].toLowerCase()) {
+                        await waSock.sendMessage(from, { text: "❌ Token konfirmasi salah." }, { quoted: msg });
+                        return;
+                    }
+                    pendingSensitiveActions.delete(String(from));
+                    const execRes = await executeSensitiveAction(pending, from);
+                    await waSock.sendMessage(from, { text: execRes.ok ? `✅ ${execRes.text}` : `❌ ${execRes.text}` }, { quoted: msg });
+                    return;
+                }
+
+                // Background queue controls
+                if (/^(bg status|status bg|queue status)$/i.test(textMessage.trim())) {
+                    await waSock.sendMessage(from, { text: getBgStatusText() }, { quoted: msg });
+                    return;
+                }
+                const bgCancelMatch = textMessage.trim().match(/^(?:bg cancel|cancel bg)\s*(\S+)?$/i);
+                if (bgCancelMatch) {
+                    const selector = bgCancelMatch[1] || 'last';
+                    const res = cancelBgTask(selector);
+                    await waSock.sendMessage(from, { text: res.ok ? `✅ ${res.msg}` : `❌ ${res.msg}` }, { quoted: msg });
+                    return;
                 }
                 
                 // 3a. CHECK READ MODE FOR DMS / GROUPS
@@ -669,9 +1165,17 @@ export async function connectToWhatsApp() {
                 } else if (lowerText.startsWith('.openx')) {
                     isComplex = false;
                     aiPromptUser = textMessage.trim().substring(6).trim();
+                } else if (!isGroup) {
+                    // Natural-chat mode for direct messages (no command prefix needed)
+                    aiPromptUser = textMessage.trim();
+                    const complexHint = /(analis|analysis|debug|refactor|step by step|rinci|mendalam|kompleks|code|kode)/i;
+                    isComplex = textMessage.length > 220 || complexHint.test(textMessage);
                 } else {
+                    // Keep groups command-based to avoid noisy auto-replies
                     return;
                 }
+
+                if (!aiPromptUser) return;
 
                 // --- SMART QUEUE ---
                 const existingReq = aiQueue.find(q => q.from === from);

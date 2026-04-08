@@ -96,6 +96,24 @@ export async function handleMessage(jid, text) {
         SelfUpdate.cancelUpdate();
         return true;
     }
+    if (lower === 'preview update') {
+        const p = SelfUpdate.getPendingSummary();
+        if (!p) {
+            if (waSock) waSock.sendMessage(jid, { text: '⚠️ Belum ada pending update.' }).catch(() => {});
+            return true;
+        }
+        const msg =
+            `🧪 *Preview SelfUpdate*\n` +
+            `Modul      : ${p.moduleName}.mjs\n` +
+            `Instruksi  : ${p.instruction || '-'}\n` +
+            `Baris lama : ${p.oldLineCount}\n` +
+            `Baris baru : ${p.newLineCount}\n` +
+            `Delta      : ${p.delta >= 0 ? '+' : ''}${p.delta}\n` +
+            `Age        : ${p.ageSec} detik\n\n` +
+            `Ketik *apply update* kalau sudah oke.`;
+        if (waSock) waSock.sendMessage(jid, { text: msg }).catch(() => {});
+        return true;
+    }
 
     // "update <ModuleName>, <instruction>"
     const updateMatch = text.match(/^update\s+(\w+)[,，]\s*(.+)$/i);
@@ -150,6 +168,54 @@ export async function handleMessage(jid, text) {
         const usage = NetworkIntel.getDataUsage();
         const lines = usage.slice(0, 10).map(u => `  ${u.name}: *${u.mb} MB*`).join('\n');
         if (waSock) waSock.sendMessage(jid, { text: `📶 *Top App Data Usage*:\n${lines || '(kosong)'}` }).catch(() => {});
+        return true;
+    }
+    if (/^(network config|net config|config network)$/i.test(lower)) {
+        const c = NetworkIntel.getConfig();
+        const msg =
+            `⚙️ *NetworkIntel Config*\n` +
+            `Interval  : ${c.intervalSec}s\n` +
+            `Spike     : ${c.spikeMb} MB / interval\n` +
+            `Hotspot   : ${c.hotspotMonitor ? 'ON' : 'OFF'}\n\n` +
+            `Contoh:\n` +
+            `- net set interval 20\n` +
+            `- net set spike 25\n` +
+            `- net set hotspot on`;
+        if (waSock) waSock.sendMessage(jid, { text: msg }).catch(() => {});
+        return true;
+    }
+    const netSetInterval = lower.match(/^net(?:work)? set interval (\d{1,3})$/i);
+    if (netSetInterval) {
+        const v = parseInt(netSetInterval[1], 10);
+        const c = NetworkIntel.updateConfig({ intervalSec: v });
+        if (waSock) waSock.sendMessage(jid, { text: `✅ Interval monitor diubah ke ${c.intervalSec}s` }).catch(() => {});
+        return true;
+    }
+    const netSetSpike = lower.match(/^net(?:work)? set spike (\d{1,3})$/i);
+    if (netSetSpike) {
+        const v = parseInt(netSetSpike[1], 10);
+        const c = NetworkIntel.updateConfig({ spikeMb: v });
+        if (waSock) waSock.sendMessage(jid, { text: `✅ Spike threshold diubah ke ${c.spikeMb} MB` }).catch(() => {});
+        return true;
+    }
+    const netSetHotspot = lower.match(/^net(?:work)? set hotspot (on|off)$/i);
+    if (netSetHotspot) {
+        const on = netSetHotspot[1].toLowerCase() === 'on';
+        const c = NetworkIntel.updateConfig({ hotspotMonitor: on });
+        if (waSock) waSock.sendMessage(jid, { text: `✅ Hotspot monitor ${c.hotspotMonitor ? 'ON' : 'OFF'}` }).catch(() => {});
+        return true;
+    }
+    if (/^(hotspot status|status hotspot)$/i.test(lower)) {
+        const hs = NetworkIntel.getHotspotStatus();
+        const lines = Object.entries(hs.interfaces || {})
+            .map(([iface, v]) => `- ${iface}: ${((v.total || 0) / 1024 / 1024).toFixed(2)} MB total`)
+            .join('\n');
+        const msg =
+            `🔥 *Hotspot Status*\n` +
+            `Monitor : ${hs.monitorEnabled ? 'ON' : 'OFF'}\n` +
+            `Aktif   : ${hs.active ? 'YA' : 'TIDAK'}\n` +
+            `${lines || '- interface hotspot belum terdeteksi'}`;
+        if (waSock) waSock.sendMessage(jid, { text: msg }).catch(() => {});
         return true;
     }
 
@@ -211,7 +277,12 @@ export async function handleMessage(jid, text) {
             `📊 *Health*\n` +
             `  • \`health report\` — generate laporan sekarang\n\n` +
             `📶 *Network*\n` +
-            `  • \`data usage\` — lihat top app data usage\n\n` +
+            `  • \`data usage\` — lihat top app data usage\n` +
+            `  • \`network config\` — lihat konfigurasi monitor\n` +
+            `  • \`net set interval 20\`\n` +
+            `  • \`net set spike 25\`\n` +
+            `  • \`net set hotspot on/off\`\n` +
+            `  • \`hotspot status\`\n\n` +
             `📋 *Session*\n` +
             `  • \`log tadi\` — ringkasan aksi sesi ini\n` +
             `  • \`undo terakhir\` — batalkan aksi terakhir\n` +
@@ -220,7 +291,8 @@ export async function handleMessage(jid, text) {
             `  • \`kalau [app] udah ditutup, matiin WiFi terus ingetin tidur jam 11\`\n\n` +
             `🤖 *Self Update*\n` +
             `  • \`update BatteryOptimizer, [instruksi]\`\n` +
-            `  • \`apply update\` | \`cancel update\` | \`rollback [modul]\`\n\n` +
+            `  • \`preview update\` | \`apply update\` | \`cancel update\`\n` +
+            `  • \`rollback [modul]\`\n\n` +
             `📈 *Patterns*\n` +
             `  • \`pola\` — lihat kebiasaan penggunaan\n` +
             `  • \`.modules\` — tampilkan menu ini`;

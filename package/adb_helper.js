@@ -88,6 +88,14 @@ export async function openApp(pkgName) {
 }
 
 /**
+ * Open an app using monkey launcher trigger.
+ * Alias with stronger name for AI command mapping.
+ */
+export async function launchApp(pkgName) {
+    return openApp(pkgName);
+}
+
+/**
  * Captures a high-quality screenshot from the device.
  */
 export function takeScreenshot(outputPath) {
@@ -147,6 +155,184 @@ export async function sendNotification(title, message) {
     } catch (e) {
         return false;
     }
+}
+
+/**
+ * Dump current UI hierarchy XML using uiautomator.
+ * Returns lightweight metadata so caller can inspect quickly.
+ */
+export async function dumpUiHierarchy() {
+    try {
+        const devicePath = '/sdcard/window_dump.xml';
+        await execPromise(`adb shell uiautomator dump ${devicePath}`);
+        const { stdout } = await execPromise(`adb shell cat ${devicePath}`);
+        const nodeCount = (stdout.match(/<node /g) || []).length;
+        return {
+            ok: true,
+            nodeCount,
+            xml: stdout
+        };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+/**
+ * Try to tap a UI node by visible text using bounds from UIAutomator XML.
+ */
+export async function tapByText(text) {
+    try {
+        const dump = await dumpUiHierarchy();
+        if (!dump.ok) return false;
+
+        const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const rx = new RegExp(`<node[^>]*text="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i');
+        const m = dump.xml.match(rx);
+        if (!m) return false;
+
+        const x = Math.floor((parseInt(m[1]) + parseInt(m[3])) / 2);
+        const y = Math.floor((parseInt(m[2]) + parseInt(m[4])) / 2);
+        await execPromise(`adb shell input tap ${x} ${y}`);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Try to tap a UI node by resource-id using bounds from UIAutomator XML.
+ */
+export async function tapByResourceId(resourceId) {
+    try {
+        const dump = await dumpUiHierarchy();
+        if (!dump.ok) return false;
+
+        const escaped = resourceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const rx = new RegExp(`<node[^>]*resource-id="${escaped}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`, 'i');
+        const m = dump.xml.match(rx);
+        if (!m) return false;
+
+        const x = Math.floor((parseInt(m[1]) + parseInt(m[3])) / 2);
+        const y = Math.floor((parseInt(m[2]) + parseInt(m[4])) / 2);
+        await execPromise(`adb shell input tap ${x} ${y}`);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Scroll the screen using a swipe gesture.
+ */
+export async function scrollScreen(direction = 'down') {
+    try {
+        const d = String(direction).toLowerCase();
+        if (d === 'up') {
+            await execPromise('adb shell input swipe 500 600 500 1400 350');
+            return true;
+        }
+        await execPromise('adb shell input swipe 500 1400 500 600 350');
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Press common navigation keys.
+ */
+export async function pressBack() {
+    try {
+        await execPromise('adb shell input keyevent 4');
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export async function pressHome() {
+    try {
+        await execPromise('adb shell input keyevent 3');
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Execute semicolon-delimited UI flow in sequence.
+ * Format example:
+ *   open:com.whatsapp;tap_text:Search;type:hello;scroll:down;back
+ */
+export async function runUiFlow(flowText, options = {}) {
+    return runUiFlowWithOptions(flowText, options);
+}
+
+async function hasTextInUi(text) {
+    const dump = await dumpUiHierarchy();
+    if (!dump.ok) return false;
+    const escaped = String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rx = new RegExp(`text="${escaped}"`, 'i');
+    return rx.test(dump.xml);
+}
+
+async function hasIdInUi(resourceId) {
+    const dump = await dumpUiHierarchy();
+    if (!dump.ok) return false;
+    const escaped = String(resourceId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rx = new RegExp(`resource-id="${escaped}"`, 'i');
+    return rx.test(dump.xml);
+}
+
+async function runUiFlowWithOptions(flowText, options = {}) {
+    const steps = String(flowText || '')
+        .split(';')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+    const retries = Math.min(Math.max(parseInt(options.retries ?? 1, 10), 0), 5);
+    const verifyWaitMs = Math.min(Math.max(parseInt(options.verifyWaitMs ?? 500, 10), 100), 5000);
+    const logs = [];
+    if (steps.length === 0) {
+        return { ok: false, logs: ['No steps provided'] };
+    }
+
+    for (const raw of steps) {
+        const [opRaw, ...rest] = raw.split(':');
+        const op = String(opRaw || '').trim().toLowerCase();
+        const arg = rest.join(':').trim();
+        let ok = false;
+        const tryCount = retries + 1;
+
+        for (let i = 0; i < tryCount; i++) {
+            if (op === 'open' && arg) ok = await launchApp(arg);
+            else if (op === 'tap_text' && arg) ok = await tapByText(arg);
+            else if (op === 'tap_id' && arg) ok = await tapByResourceId(arg);
+            else if (op === 'scroll') ok = await scrollScreen(arg || 'down');
+            else if (op === 'back') ok = await pressBack();
+            else if (op === 'home') ok = await pressHome();
+            else if (op === 'type' && arg) ok = await typeText(arg);
+            else if (op === 'wait') {
+                const ms = Math.min(Math.max(parseInt(arg || '500', 10), 100), 10000);
+                await new Promise(r => setTimeout(r, ms));
+                ok = true;
+            } else if (op === 'verify_text' && arg) {
+                await new Promise(r => setTimeout(r, verifyWaitMs));
+                ok = await hasTextInUi(arg);
+            } else if (op === 'verify_id' && arg) {
+                await new Promise(r => setTimeout(r, verifyWaitMs));
+                ok = await hasIdInUi(arg);
+            }
+
+            if (ok) break;
+            if (i < tryCount - 1) await new Promise(r => setTimeout(r, 350));
+        }
+
+        logs.push(`${ok ? 'OK' : 'FAIL'} ${raw}${tryCount > 1 ? ` (retry=${retries})` : ''}`);
+        if (!ok) return { ok: false, logs };
+    }
+
+    return { ok: true, logs };
 }
 
 /**
