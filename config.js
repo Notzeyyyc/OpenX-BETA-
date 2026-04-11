@@ -66,5 +66,18 @@ export const config = {
         npm: splitCsv(process.env.OPENX_PLUGINS_NPM),
         /** Optional: allow loading plugins without a sha256 pin (NOT recommended) */
         allowUnpinned: (process.env.OPENX_ALLOW_UNPINNED_PLUGINS || "").toLowerCase() === "true",
+    },
+
+    /** Optional REST API server (disabled by default). */
+    rest: {
+        enabled: (process.env.OPENX_REST_ENABLED || '').toLowerCase() === 'true',
+        /** Bind address (use 127.0.0.1 by default for safety). */
+        host: process.env.OPENX_REST_HOST || '127.0.0.1',
+        /** Port to listen on. */
+        port: Number(process.env.OPENX_REST_PORT || '8787'),
+        /** API key required in query param: ?apikey=... */
+        apiKey: process.env.OPENX_REST_API_KEY || 'openx-local-dev',
+        /** Max JSON body size for POST endpoints (bytes). */
+        maxBodyBytes: Number(process.env.OPENX_REST_MAX_BODY_BYTES || String(256 * 1024)),
     }
 };

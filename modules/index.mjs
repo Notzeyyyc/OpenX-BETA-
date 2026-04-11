@@ -18,6 +18,8 @@ import {
     handlePluginsMessage,
 } from '../package/openx/plugin_manager.mjs';
 
+import { startRestServer } from '../package/openx/rest_server.mjs';
+
 // ── Module imports ────────────────────────────────────────────────────────────
 import * as BehaviorLearning from './BehaviorLearning.mjs';
 import * as NetworkIntel     from './NetworkIntel.mjs';
@@ -71,6 +73,9 @@ export function initModules(adminJid, sendMessage) {
 
     // Start plugin system (optional)
     initPluginManager({ notify, sendMessageFn: sendMessage }).catch(() => {});
+
+    // Start REST server (optional)
+    startRestServer({ notify });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
