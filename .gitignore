@@ -1,6 +1,7 @@
 node_modules/
 caches/
 log.txt
+.env
 package/wa_read_cache.json
 package/schedules.json
 package/storage/*

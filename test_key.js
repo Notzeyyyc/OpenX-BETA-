@@ -2,7 +2,9 @@ import { config } from "./config.js";
 
 async function checkAccount(apiKey, index) {
     console.log(`Checking OpenRouter API Key #${index}...`);
-    console.log(`Key: ${apiKey.substring(0, 10)}...`);
+    // Avoid printing secrets. Show only last 4 chars.
+    const tail = String(apiKey).slice(-4);
+    console.log(`Key: ****${tail}`);
 
     if (apiKey.includes("REPLACE_WITH")) {
         console.warn(`[!] Key #${index} is still a placeholder. Skipping.`);
@@ -38,7 +40,7 @@ async function checkAccount(apiKey, index) {
 async function run() {
     const keys = config.openrouter.apiKeys || [];
     if (keys.length === 0) {
-        console.error("No API keys found in config.js");
+        console.error("No API keys found. Set OPENX_OPENROUTER_API_KEYS in your environment.");
         return;
     }
 

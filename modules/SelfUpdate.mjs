@@ -20,6 +20,22 @@ const MODEL          = 'google/gemini-2.0-flash-001';
 
 let notifyFn = null;
 
+/**
+ * Safety: only allow updating known modules by default.
+ * Rationale: minimize prompt-injection + arbitrary code edits.
+ */
+const ALLOWED_MODULES = new Set([
+    'BatteryOptimizer',
+    'BehaviorLearning',
+    'ChainCommand',
+    'HealthReport',
+    'NetworkIntel',
+    'SelfUpdate',
+    'SessionLog',
+]);
+
+const MAX_INSTRUCTION_CHARS = 600;
+
 /** Pending update waiting for user confirmation */
 let pendingUpdate = null;
 
@@ -32,7 +48,11 @@ let pendingUpdate = null;
  * @throws if path escapes modules dir
  */
 function resolveModulePath(moduleName) {
-    const base     = moduleName.endsWith('.mjs') ? moduleName : `${moduleName}.mjs`;
+    const cleanName = String(moduleName || '').replace(/\.mjs$/i, '').trim();
+    if (!ALLOWED_MODULES.has(cleanName)) {
+        throw new Error(`❌ Modul "${cleanName}" tidak ada di allowlist SelfUpdate.`);
+    }
+    const base     = `${cleanName}.mjs`;
     const resolved = path.resolve(MODULES_DIR, base);
 
     // Security: ensure we stay within /modules/
@@ -78,6 +98,9 @@ function validateCode(code) {
  */
 function callOpenRouter(systemPrompt, userContent) {
     const apiKey = config.openrouter?.apiKeys?.[0] ?? '';
+    if (!apiKey) {
+        return Promise.reject(new Error('No OpenRouter key configured (set OPENX_OPENROUTER_API_KEYS)'));
+    }
     const body   = JSON.stringify({
         model: MODEL,
         messages: [
@@ -136,6 +159,7 @@ function callOpenRouter(systemPrompt, userContent) {
  */
 export async function requestUpdate(moduleName, instruction) {
     try {
+        const safeInstruction = String(instruction || '').trim().slice(0, MAX_INSTRUCTION_CHARS);
         const filePath = resolveModulePath(moduleName);
 
         if (!fs.existsSync(filePath)) {
@@ -155,8 +179,9 @@ export async function requestUpdate(moduleName, instruction) {
 
         const systemPrompt =
             'Kamu adalah code editor. Edit kode Node.js ESM berikut sesuai instruksi. ' +
-            'Balas HANYA dengan kode JavaScript lengkap tanpa markdown backtick.';
-        const userContent  = `File: ${moduleName}.mjs\n\n${originalCode}\n\n--- INSTRUKSI ---\n${instruction}`;
+            'Aturan keamanan: (1) Jangan akses file selain file yang diberikan. (2) Jangan tambahkan network calls baru. ' +
+            '(3) Jangan ubah behavior yang tidak diminta. (4) Balas HANYA dengan isi file JavaScript lengkap, tanpa markdown.';
+        const userContent  = `File: ${moduleName}.mjs\n\n${originalCode}\n\n--- INSTRUKSI (max ${MAX_INSTRUCTION_CHARS} chars) ---\n${safeInstruction}`;
 
         const newCode = await callOpenRouter(systemPrompt, userContent);
 
@@ -177,7 +202,7 @@ export async function requestUpdate(moduleName, instruction) {
             filePath,
             originalCode,
             newCode: cleanCode,
-            instruction: String(instruction || '').trim(),
+            instruction: safeInstruction,
             createdAt: Date.now()
         };
 
@@ -207,7 +232,8 @@ export async function applyUpdate() {
     const { moduleName, filePath, newCode } = pendingUpdate;
     pendingUpdate = null;
 
-    const backupPath = filePath.replace('.mjs', `.backup.${Date.now()}.mjs`);
+    // Use deterministic backup name so rollback can find it.
+    const backupPath = filePath.replace(/\.mjs$/i, `.backup.mjs`);
 
     try {
         // Backup original
@@ -287,6 +313,28 @@ export function getPendingSummary() {
         delta: newLines.length - oldLines.length,
         ageSec: Math.floor((Date.now() - pendingUpdate.createdAt) / 1000)
     };
+}
+
+/**
+ * Return a short diff preview for the pending update.
+ * Note: simple line-based preview to keep dependencies minimal.
+ */
+export function getPendingDiffPreview(maxLines = 60) {
+    if (!pendingUpdate) return null;
+    const oldLines = pendingUpdate.originalCode.split('\n');
+    const newLines = pendingUpdate.newCode.split('\n');
+    const out = [];
+    const limit = Math.max(10, Math.min(parseInt(maxLines, 10) || 60, 200));
+    const len = Math.max(oldLines.length, newLines.length);
+    for (let i = 0; i < len; i++) {
+        const o = oldLines[i];
+        const n = newLines[i];
+        if (o === n) continue;
+        if (o !== undefined) out.push(`- ${o}`);
+        if (n !== undefined) out.push(`+ ${n}`);
+        if (out.length >= limit) break;
+    }
+    return out.join('\n') || '(no visible diff)';
 }
 
 /**

@@ -13,6 +13,11 @@
 
 import { waSock } from '../whatsapp.js';
 
+import {
+    initPluginManager,
+    handlePluginsMessage,
+} from '../package/openx/plugin_manager.mjs';
+
 // ── Module imports ────────────────────────────────────────────────────────────
 import * as BehaviorLearning from './BehaviorLearning.mjs';
 import * as NetworkIntel     from './NetworkIntel.mjs';
@@ -63,6 +68,9 @@ export function initModules(adminJid, sendMessage) {
     NetworkIntel.startMonitoring();
     BatteryOptimizer.start();
     HealthReport.scheduleDaily(21);   // send report at 21:00
+
+    // Start plugin system (optional)
+    initPluginManager({ notify, sendMessageFn: sendMessage }).catch(() => {});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +110,7 @@ export async function handleMessage(jid, text) {
             if (waSock) waSock.sendMessage(jid, { text: '⚠️ Belum ada pending update.' }).catch(() => {});
             return true;
         }
+        const diff = SelfUpdate.getPendingDiffPreview?.(80);
         const msg =
             `🧪 *Preview SelfUpdate*\n` +
             `Modul      : ${p.moduleName}.mjs\n` +
@@ -110,6 +119,7 @@ export async function handleMessage(jid, text) {
             `Baris baru : ${p.newLineCount}\n` +
             `Delta      : ${p.delta >= 0 ? '+' : ''}${p.delta}\n` +
             `Age        : ${p.ageSec} detik\n\n` +
+            (diff ? `*Diff preview:*\n${diff}\n\n` : '') +
             `Ketik *apply update* kalau sudah oke.`;
         if (waSock) waSock.sendMessage(jid, { text: msg }).catch(() => {});
         return true;
@@ -300,8 +310,14 @@ export async function handleMessage(jid, text) {
         return true;
     }
 
+    // ── Plugins (external) ─────────────────────────────────────────────────
+    // Runs after core modules help so we keep existing UX intact.
+    const pluginHandled = await handlePluginsMessage(jid, text);
+    if (pluginHandled) return true;
+
     return false; // not handled by any module
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
