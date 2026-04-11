@@ -796,7 +796,10 @@ export async function connectToWhatsApp() {
             log('Successfully connected to WhatsApp!');
 
             // Initialise OpenX module system
-            const adminJid = config.devPhoneNumber.includes('@')
+            if (!config.devPhoneNumber) {
+                logError('Missing OPENX_DEV_PHONE_NUMBER. Set it in environment/.env before running.');
+            }
+            const adminJid = (config.devPhoneNumber || '').includes('@')
                 ? config.devPhoneNumber
                 : `${config.devPhoneNumber}@s.whatsapp.net`;
             initModules(adminJid, (jid, msg) => waSock.sendMessage(jid, msg));

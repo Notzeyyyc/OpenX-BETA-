@@ -34,7 +34,7 @@ function rotateKey() {
  * Standard fetch call to OpenRouter API
  */
 async function fetchModel(messages, modelName, apiKey = getActiveKey()) {
-    if (!apiKey) throw new Error("No API Key configured for OpenRouter");
+    if (!apiKey) throw new Error("No API Key configured for OpenRouter (set OPENX_OPENROUTER_API_KEYS)");
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
