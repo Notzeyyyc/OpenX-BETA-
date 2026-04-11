@@ -44,6 +44,11 @@ function makeHost() {
             async chat(args) {
                 return await rpcHostCall('ai.chat', args);
             }
+        },
+        net: {
+            async fetch(args) {
+                return await rpcHostCall('net.fetch', args);
+            }
         }
     };
 }
@@ -65,6 +70,21 @@ process.on('message', async (msg) => {
         }
 
         if (msg.type !== 'rpc_req') return;
+
+        if (msg.method === 'plugin.listTools') {
+            const tools = Array.isArray(pluginMod?.tools) ? pluginMod.tools : [];
+            return rpcRes(msg.id, true, tools);
+        }
+
+        if (msg.method === 'plugin.runTool') {
+            if (!pluginMod || typeof pluginMod.runTool !== 'function') {
+                return rpcRes(msg.id, false, new Error(`Plugin ${pluginId}: runTool not exported`));
+            }
+            const toolId = msg.params?.toolId;
+            const input = msg.params?.input;
+            const res = await pluginMod.runTool({ toolId, input, host: makeHost() });
+            return rpcRes(msg.id, true, res);
+        }
 
         if (msg.method === 'plugin.onMessage') {
             if (!pluginMod || typeof pluginMod.onMessage !== 'function') {
@@ -90,4 +110,3 @@ process.on('message', async (msg) => {
         process.exitCode = 1;
     }
 });
-

@@ -1,5 +1,12 @@
 {
   "$schema": "./plugins.schema.json",
-  "plugins": []
+  "plugins": [
+    {
+      "id": "openx-plugin-fgsi-xai-grok",
+      "entry": "./package/openx/plugins/openx-plugin-fgsi-xai-grok/index.js",
+      "enabled": false,
+      "sandbox": false,
+      "permissions": ["net.fetch"]
+    }
+  ]
 }
-

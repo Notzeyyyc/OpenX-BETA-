@@ -1,4 +1,7 @@
 {
-  "plugins": {}
+  "plugins": {
+    "openx-plugin-fgsi-xai-grok": {
+      "sha256": "c0ef6e21a51b4b2b74d6082e5a424450d260d762ff762f8df13eb79dd465a98a"
+    }
+  }
 }
-

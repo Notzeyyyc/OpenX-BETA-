@@ -28,6 +28,8 @@ let sendMessage = null;
 /** @type {Map<string, any>} */
 const loaded = new Map();
 
+/** @typedef {{id: string, name?: string, description?: string, inputSchema?: any}} PluginTool */
+
 function safeJsonRead(p, fallback) {
     try {
         if (!fs.existsSync(p)) return fallback;
@@ -40,6 +42,19 @@ function safeJsonRead(p, fallback) {
 function sha256File(filePath) {
     const buf = fs.readFileSync(filePath);
     return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+async function readResponseWithLimit(res, maxBytes) {
+    let total = 0;
+    const chunks = [];
+    for await (const chunk of res) {
+        total += chunk.length;
+        if (total > maxBytes) {
+            throw new Error(`Response too large (>${maxBytes} bytes)`);
+        }
+        chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
 }
 
 async function resolveEntryToFileUrl(entry) {
@@ -64,6 +79,14 @@ async function computeEntrySha256(entry) {
     }
     const filePath = fileURLToPath(url);
     return { url, filePath, sha256: sha256File(filePath) };
+}
+
+/**
+ * Compute sha256 for a plugin entry (path or bare specifier), using the same resolution
+ * as the loader. Useful for pinning when installing plugins.
+ */
+export async function computePluginEntrySha256(entry) {
+    return await computeEntrySha256(entry);
 }
 
 function getGrantedPermissions(pluginCfg) {
@@ -102,6 +125,50 @@ function makeHostApi(pluginId, granted) {
                 const messages = Array.isArray(args?.messages) ? args.messages : [];
                 return await chatCompletion(messages, args?.model ?? null, !!args?.isComplex);
             }
+        },
+        net: {
+            /**
+             * Minimal network client for REST-backed tools.
+             * Permission: net.fetch
+             *
+             * @param {{url: string, method?: string, headers?: Record<string,string>, body?: string, timeoutMs?: number, maxBytes?: number}} args
+             */
+            async fetch(args) {
+                requirePerm('net.fetch');
+                const urlStr = String(args?.url || '').trim();
+                if (!urlStr) throw new Error('url is required');
+
+                let u;
+                try { u = new URL(urlStr); } catch { throw new Error('Invalid url'); }
+                if (u.protocol !== 'https:') throw new Error('Only https: is allowed');
+
+                const method = String(args?.method || 'GET').toUpperCase();
+                const headers = (args?.headers && typeof args.headers === 'object') ? args.headers : {};
+                const body = args?.body === undefined ? undefined : String(args.body);
+                const timeoutMs = Number(args?.timeoutMs || 15_000);
+                const maxBytes = Number(args?.maxBytes || 512 * 1024);
+
+                const ac = new AbortController();
+                const t = setTimeout(() => ac.abort(new Error('timeout')), timeoutMs);
+                try {
+                    const res = await fetch(u, {
+                        method,
+                        headers,
+                        body,
+                        signal: ac.signal,
+                    });
+                    const buf = await readResponseWithLimit(res.body, maxBytes);
+                    const text = buf.toString('utf-8');
+                    return {
+                        ok: true,
+                        status: res.status,
+                        headers: Object.fromEntries(res.headers.entries()),
+                        text,
+                    };
+                } finally {
+                    clearTimeout(t);
+                }
+            }
         }
     };
 }
@@ -130,6 +197,7 @@ function makeSandboxProxy(pluginId, childProc, granted) {
                 let res;
                 if (method === 'wa.sendText') res = await host.wa.sendText(params);
                 else if (method === 'ai.chat') res = await host.ai.chat(params);
+                else if (method === 'net.fetch') res = await host.net.fetch(params);
                 else throw new Error(`Unknown host method: ${method}`);
                 childProc.send({ type: 'rpc_res', id: msg.id, ok: true, result: res });
             } catch (e) {
@@ -206,6 +274,14 @@ async function loadOne(pluginCfg, lock) {
             sha256,
             sandbox: true,
             permissions: [...granted],
+            tools: null,
+            listTools: async () => {
+                const res = await rpc('plugin.listTools', {});
+                return Array.isArray(res) ? res : [];
+            },
+            runTool: async ({ toolId, input }) => {
+                return await rpc('plugin.runTool', { toolId, input });
+            },
             onMessage: async ({ jid, text }) => {
                 // Provide host via parent; plugin calls host through rpc('host.call', ...)
                 // Sandbox runner calls back to parent with host requests.
@@ -220,6 +296,8 @@ async function loadOne(pluginCfg, lock) {
     const mod = await import(url);
     const onMessage = typeof mod.onMessage === 'function' ? mod.onMessage : null;
     const init = typeof mod.init === 'function' ? mod.init : null;
+    const tools = Array.isArray(mod.tools) ? mod.tools : [];
+    const runTool = typeof mod.runTool === 'function' ? mod.runTool : null;
     const host = makeHostApi(id, granted);
 
     if (init) {
@@ -236,6 +314,12 @@ async function loadOne(pluginCfg, lock) {
         sha256,
         sandbox: false,
         permissions: [...granted],
+        tools,
+        listTools: async () => tools,
+        runTool: async ({ toolId, input }) => {
+            if (!runTool) throw new Error(`Plugin ${id} does not export runTool()`);
+            return await runTool({ toolId, input, host });
+        },
         onMessage: async ({ jid, text }) => {
             if (!onMessage) return { handled: false };
             return await onMessage({ jid, text, host });
@@ -299,8 +383,47 @@ export function listPlugins() {
         entry: p.entry,
         sandbox: !!p.sandbox,
         permissions: p.permissions || [],
-        sha256: p.sha256
+        sha256: p.sha256,
+        toolCount: Array.isArray(p.tools) ? p.tools.length : undefined,
     }));
+}
+
+/** Aggregate all tools from loaded plugins. */
+export async function listTools() {
+    /** @type {Array<{toolId: string, pluginId: string, tool: PluginTool}>} */
+    const out = [];
+    for (const p of loaded.values()) {
+        let tools = [];
+        try {
+            if (typeof p.listTools === 'function') tools = await p.listTools();
+            else if (Array.isArray(p.tools)) tools = p.tools;
+        } catch {
+            tools = [];
+        }
+        for (const t of (Array.isArray(tools) ? tools : [])) {
+            const id = String(t?.id || '').trim();
+            if (!id) continue;
+            out.push({ toolId: `${p.id}/${id}`, pluginId: p.id, tool: t });
+        }
+    }
+    return out;
+}
+
+/** Execute a tool by namespaced id: "pluginId/toolId". */
+export async function executeTool(namespacedToolId, input) {
+    const raw = String(namespacedToolId || '').trim();
+    const idx = raw.indexOf('/');
+    if (idx <= 0) throw new Error('Invalid toolId format, expected "pluginId/toolId"');
+    const pluginId = raw.slice(0, idx);
+    const toolId = raw.slice(idx + 1);
+    const p = loaded.get(pluginId);
+    if (!p) throw new Error(`Plugin not loaded: ${pluginId}`);
+    if (typeof p.runTool !== 'function') throw new Error(`Plugin ${pluginId} cannot execute tools`);
+    return await p.runTool({ toolId, input });
+}
+
+export async function reloadPlugins() {
+    return await initPluginManager({ notify: notifyFn, sendMessageFn: sendMessage });
 }
 
 export async function handlePluginCommand(jid, text) {
